@@ -1,0 +1,697 @@
+/**
+ * A `BaseTemplateManagerBackend` that stores managed templates as FHIR resources in Medplum.
+ *
+ * Three resource types carry the whole seam:
+ *
+ * | Managed concept | FHIR resource |
+ * |---|---|
+ * | A template *version* | `MessageDefinition`, versioned by `url` + `version` |
+ * | A tag | `Basic`, FHIR's escape hatch for a concept it does not model |
+ * | A status change | `Provenance`, which is what FHIR calls an audit record |
+ *
+ * `MessageDefinition` is not a stretch: FHIR's own description of it is "the definition of a
+ * message that can be sent", identified by a canonical URL and a version — which is a managed
+ * template exactly. What it has no field for (three template sources, a tag's text) goes in an
+ * extension; what a query has to narrow on additionally goes in an identifier, because
+ * `identifier` is a token search and every FHIR server answers those the same way.
+ *
+ * ## Filtering
+ *
+ * FHIR search is an AND of parameters with no general OR and no general negation, so a filter is
+ * pushed down as far as it goes (see `search.ts`) and finished in memory with the library's own
+ * evaluator. Every filter the vocabulary defines therefore works — including `or`, `not`, the
+ * string lookups FHIR has no modifier for, and `mostRecentActiveVersion`, which is a comparison
+ * against a key's other rows that no query language expresses. The cost is a scan bounded by
+ * `maxScan`, which throws rather than truncating: a short page that looks complete is the one
+ * failure a caller cannot detect.
+ *
+ * That is why `getFilterCapabilities` declares nothing — a backend declares only what it *cannot*
+ * do, and this one has no filter it must refuse.
+ */
+
+import type { MedplumClient } from '@medplum/core';
+import type { Basic, MessageDefinition, Provenance } from '@medplum/fhirtypes';
+import type { BaseLogger } from 'vintasend';
+import {
+  type BaseTemplateManagerBackend,
+  type ManagedTemplate,
+  type ManagedTemplateCreateInput,
+  type ManagedTemplateFilter,
+  type ManagedTemplateFilterCapabilities,
+  ManagedTemplateInvalidTagError,
+  ManagedTemplateNotFoundError,
+  type ManagedTemplateStatus,
+  type ManagedTemplateStatusHistory,
+  type ManagedTemplateTag,
+  ManagedTemplateTagAlreadyExistsError,
+  ManagedTemplateTagNotFoundError,
+  type ManagedTemplateTagStatus,
+  type ManagedTemplateUpdateInput,
+  matchesTemplateFilter,
+  nextAvailableSlug,
+  normalizeTagText,
+  paginate,
+  slugifyTag,
+} from 'vintasend-managed-templates';
+
+import {
+  DEFAULT_MAX_SCAN,
+  DEFAULT_URL_PREFIX,
+  IDENTIFIER_SYSTEM,
+  SEARCH_PAGE_SIZE,
+} from './constants.js';
+import {
+  buildStatusChangeResource,
+  buildTagResource,
+  buildTemplateResource,
+  deriveIsAbstract,
+  readTemplateTagSlugs,
+  statusChangeTargetId,
+  toManagedTag,
+  toManagedTemplate,
+  toStatusHistory,
+  withTagStatus,
+  withTagText,
+  withTemplateStatus,
+  withTemplateTags,
+} from './mapping.js';
+import {
+  deriveSearchTuples,
+  escapeSearchValue,
+  type SearchTuples,
+  tagKindTuple,
+  templateKindTuple,
+} from './search.js';
+
+export type MedplumTemplateManagerBackendOptions = {
+  /**
+   * Prefix for the canonical `MessageDefinition.url`, which is `<prefix><key>`. Give a deployment
+   * its own prefix when one Medplum project holds templates for more than one application.
+   */
+  urlPrefix?: string;
+  /**
+   * How many resources one read will pull back before throwing. See the note on
+   * `DEFAULT_MAX_SCAN`.
+   */
+  maxScan?: number;
+  /**
+   * How many resources one search request asks for. Medplum caps this at 1000, which is the
+   * default; lower it only for a server that struggles with pages that size.
+   */
+  pageSize?: number;
+};
+
+export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend {
+  private logger: BaseLogger | null = null;
+
+  private readonly urlPrefix: string;
+
+  private readonly maxScan: number;
+
+  private readonly pageSize: number;
+
+  constructor(
+    private readonly medplum: MedplumClient,
+    options: MedplumTemplateManagerBackendOptions = {},
+  ) {
+    this.urlPrefix = options.urlPrefix ?? DEFAULT_URL_PREFIX;
+    this.maxScan = options.maxScan ?? DEFAULT_MAX_SCAN;
+    this.pageSize = options.pageSize ?? SEARCH_PAGE_SIZE;
+  }
+
+  injectLogger(logger: BaseLogger): void {
+    this.logger = logger;
+  }
+
+  /**
+   * Nothing is declared, because there is no filter this backend must refuse.
+   *
+   * What FHIR search cannot express is finished in memory rather than rejected, so every field,
+   * lookup and logical group in the vocabulary is answerable. Declaring a limitation here that
+   * does not exist would have callers drop filters that work.
+   */
+  getFilterCapabilities(): ManagedTemplateFilterCapabilities {
+    return {};
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Templates
+  // -------------------------------------------------------------------------------------------
+
+  async createTemplate(data: ManagedTemplateCreateInput): Promise<ManagedTemplate> {
+    const tags = await this.getOrCreateTags(data.tags ?? [], data.tenant);
+    const created = await this.medplum.createResource(
+      buildTemplateResource(
+        {
+          key: data.key,
+          version: 1,
+          name: data.name,
+          description: data.description,
+          templateManagedBackend: data.templateManagedBackend,
+          bodyTemplate: data.bodyTemplate,
+          subjectTemplate: data.subjectTemplate,
+          preheaderTemplate: data.preheaderTemplate,
+          status: 'draft',
+          tenant: data.tenant,
+          createdAt: new Date(),
+          tags,
+        },
+        this.urlPrefix,
+      ),
+    );
+    return toManagedTemplate(created, indexBySlug(tags));
+  }
+
+  async getTemplate(templateKey: string, version: number | null = null): Promise<ManagedTemplate> {
+    const resource = await this.requireResource(templateKey, version);
+    return this.hydrate([resource]).then((templates) => templates[0] as ManagedTemplate);
+  }
+
+  /**
+   * Insert the next version of a key, leaving the version it was copied from alone.
+   *
+   * A new resource, never an edit. A version that is already active keeps its content, its status
+   * and its history while its successor is drafted, so notifications recorded against it go on
+   * rendering exactly what they were sent with — which is the whole reason templates are versioned.
+   *
+   * FHIR has no transaction around a read-then-insert, so two concurrent updates can both read the
+   * same latest version and both write `n + 1`. That is a duplicate version number rather than a
+   * lost write: both resources exist, both are readable, and the later one wins every "latest"
+   * resolution. A store that needs stricter serialization should put the writes behind its own
+   * lock — the seam has no way to ask FHIR for one.
+   */
+  async updateTemplate(
+    templateKey: string,
+    data: ManagedTemplateUpdateInput,
+  ): Promise<ManagedTemplate> {
+    const previousResource = await this.requireResource(templateKey, null);
+    const previous = (await this.hydrate([previousResource]))[0] as ManagedTemplate;
+
+    // Resolved before the insert so an unusable tag text fails the whole update rather than
+    // leaving a new version behind with the wrong labels.
+    const tags =
+      data.tags === undefined || data.tags === null
+        ? previous.tags
+        : await this.getOrCreateTags(data.tags, previous.tenant);
+
+    const created = await this.medplum.createResource(
+      buildTemplateResource(
+        {
+          key: previous.key,
+          version: previous.version + 1,
+          name: data.name || previous.name,
+          description: data.description ?? previous.description,
+          templateManagedBackend: previous.templateManagedBackend,
+          bodyTemplate: data.bodyTemplate || previous.bodyTemplate,
+          subjectTemplate: data.subjectTemplate ?? previous.subjectTemplate,
+          preheaderTemplate: data.preheaderTemplate ?? previous.preheaderTemplate,
+          // A copy nobody has reviewed should not inherit "published".
+          status: 'draft',
+          tenant: previous.tenant,
+          createdAt: new Date(),
+          tags,
+        },
+        this.urlPrefix,
+      ),
+    );
+    return toManagedTemplate(created, indexBySlug(tags));
+  }
+
+  /**
+   * Delete one version, then its audit trail.
+   *
+   * That order on purpose: the caller asked for the version to go, and a failure partway through
+   * should leave the thing they asked about gone rather than leave it in place with a trail that
+   * no longer records how it got there. Orphaned `Provenance` resources are unreachable through
+   * this backend — history is looked up through a live version — so a failed cleanup is untidy
+   * rather than wrong, and it is logged.
+   */
+  async deleteTemplate(templateKey: string, version: number | null = null): Promise<void> {
+    const resource = await this.requireResource(templateKey, version);
+    const resourceId = resource.id as string;
+
+    await this.medplum.deleteResource('MessageDefinition', resourceId);
+
+    try {
+      for (const provenance of await this.searchStatusChanges([resourceId])) {
+        await this.medplum.deleteResource('Provenance', provenance.id as string);
+      }
+    } catch (error) {
+      this.logger?.warn?.(
+        `[MedplumTemplateManager] deleted MessageDefinition/${resourceId} but could not clear ` +
+          `its status history: ${describeError(error)}`,
+      );
+    }
+  }
+
+  async createTemplateStatusUpdate(params: {
+    templateKey: string;
+    version: number;
+    status: ManagedTemplateStatus;
+    changedBy?: string | null;
+  }): Promise<void> {
+    const resource = await this.requireResource(params.templateKey, params.version);
+
+    await this.medplum.updateResource(withTemplateStatus(resource, params.status));
+    await this.medplum.createResource(
+      buildStatusChangeResource({
+        templateResourceId: resource.id as string,
+        status: params.status,
+        changedBy: params.changedBy ?? null,
+        recordedAt: new Date(),
+      }),
+    );
+  }
+
+  async getTemplateStatusHistory(
+    templateKey: string,
+    version: number | null = null,
+  ): Promise<ManagedTemplateStatusHistory[]> {
+    const resources = await this.searchTemplateResources([
+      templateKindTuple(),
+      ['identifier', `${IDENTIFIER_SYSTEM.key}|${escapeSearchValue(templateKey)}`],
+    ]);
+    if (resources.length === 0) {
+      throw new ManagedTemplateNotFoundError(describeMissing(templateKey, null));
+    }
+
+    const templates = await this.hydrate(resources);
+    const wanted = templates.filter((template) => version === null || template.version === version);
+    if (wanted.length === 0) {
+      throw new ManagedTemplateNotFoundError(describeMissing(templateKey, version));
+    }
+
+    const byResourceId = new Map(wanted.map((template) => [String(template.id), template]));
+    const changes = await this.searchStatusChanges([...byResourceId.keys()]);
+
+    return changes.flatMap((change) => {
+      const targetId = statusChangeTargetId(change);
+      const template = targetId === null ? undefined : byResourceId.get(targetId);
+      return template === undefined ? [] : [toStatusHistory(change, template)];
+    });
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Tags
+  // -------------------------------------------------------------------------------------------
+
+  /**
+   * Resolve texts to tags, creating what is missing — one tag per distinct text, in order.
+   *
+   * An existing tag is returned as it stands: its text and status are left alone, so re-using an
+   * archived tag does not quietly bring it back.
+   */
+  async getOrCreateTags(
+    texts: string[],
+    tenant: string | null = null,
+  ): Promise<ManagedTemplateTag[]> {
+    const resolved: ManagedTemplateTag[] = [];
+    for (const text of texts) {
+      const cleaned = this.cleanText(text);
+      const slug = slugifyTag(cleaned);
+      if (resolved.some((tag) => tag.slug === slug)) {
+        continue;
+      }
+      const existing = await this.findTagResource(slug);
+      resolved.push(
+        existing === null ? await this.insertTag(cleaned, tenant) : toManagedTag(existing),
+      );
+    }
+    return resolved;
+  }
+
+  async createTag(text: string, tenant: string | null = null): Promise<ManagedTemplateTag> {
+    const cleaned = this.cleanText(text);
+    const slug = slugifyTag(cleaned);
+    if ((await this.findTagResource(slug)) !== null) {
+      throw new ManagedTemplateTagAlreadyExistsError(`A tag with slug '${slug}' already exists.`);
+    }
+    return this.insertTag(cleaned, tenant);
+  }
+
+  async getTag(slug: string): Promise<ManagedTemplateTag> {
+    return toManagedTag(await this.requireTagResource(slug));
+  }
+
+  async updateTag(slug: string, text: string): Promise<ManagedTemplateTag> {
+    const resource = await this.requireTagResource(slug);
+    const cleaned = this.cleanText(text);
+    const nextSlug = await nextAvailableSlug(slugifyTag(cleaned), async (candidate) => {
+      const taken = await this.findTagResource(candidate);
+      return taken !== null && taken.id !== resource.id;
+    });
+
+    const updated = await this.medplum.updateResource(withTagText(resource, cleaned, nextSlug));
+    const tag = toManagedTag(updated);
+    await this.retagTemplates(slugifyTag(slug), tag);
+    return tag;
+  }
+
+  async setTagStatus(slug: string, status: ManagedTemplateTagStatus): Promise<ManagedTemplateTag> {
+    const resource = await this.requireTagResource(slug);
+    return toManagedTag(await this.medplum.updateResource(withTagStatus(resource, status)));
+  }
+
+  /** Delete a tag and take the label off every template carrying it. */
+  async deleteTag(slug: string): Promise<void> {
+    const resource = await this.requireTagResource(slug);
+    const normalized = slugifyTag(slug);
+
+    for (const template of await this.searchTemplatesCarryingTag(normalized)) {
+      const remaining = readTemplateTagSlugs(template).filter(
+        (candidate) => candidate !== normalized,
+      );
+      await this.medplum.updateResource(
+        withTemplateTags(template, await this.tagsForSlugs(remaining)),
+      );
+    }
+
+    await this.medplum.deleteResource('Basic', resource.id as string);
+  }
+
+  async getTags(
+    status: ManagedTemplateTagStatus[] | null = null,
+    search: string | null = null,
+    tenant: string | null = null,
+  ): Promise<ManagedTemplateTag[]> {
+    const term = search === null ? null : search.toLowerCase();
+    return (await this.searchTagResources([tagKindTuple()]))
+      .map(toManagedTag)
+      .filter((tag) => status === null || status.includes(tag.status))
+      .filter((tag) => tenant === null || tag.tenant === tenant)
+      .filter(
+        (tag) =>
+          term === null ||
+          tag.text.toLowerCase().includes(term) ||
+          tag.slug.toLowerCase().includes(term),
+      );
+  }
+
+  async getTemplateTags(
+    templateKey: string,
+    version: number | null = null,
+  ): Promise<ManagedTemplateTag[]> {
+    return (await this.getTemplate(templateKey, version)).tags;
+  }
+
+  async setTemplateTags(
+    templateKey: string,
+    tags: string[],
+    version: number | null = null,
+  ): Promise<ManagedTemplate> {
+    const resource = await this.requireResource(templateKey, version);
+    const tenant = (await this.hydrate([resource]))[0]?.tenant ?? null;
+    const resolved = await this.getOrCreateTags(tags, tenant);
+
+    const updated = await this.medplum.updateResource(withTemplateTags(resource, resolved));
+    return toManagedTemplate(updated, indexBySlug(resolved));
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Queries
+  // -------------------------------------------------------------------------------------------
+
+  async getAllTemplates(): Promise<ManagedTemplate[]> {
+    return this.hydrate(await this.searchTemplateResources([templateKindTuple()]));
+  }
+
+  async getTemplatesByStatus(status: ManagedTemplateStatus[]): Promise<ManagedTemplate[]> {
+    if (status.length === 0) {
+      return [];
+    }
+    return this.hydrate(
+      await this.searchTemplateResources([
+        templateKindTuple(),
+        ['identifier', status.map((entry) => `${IDENTIFIER_SYSTEM.status}|${entry}`).join(',')],
+      ]),
+    );
+  }
+
+  async getFilteredTemplates(filters: ManagedTemplateFilter): Promise<ManagedTemplate[]> {
+    const candidates = await this.hydrate(
+      await this.searchTemplateResources(deriveSearchTuples(filters)),
+    );
+    const versionsOfKey = await this.versionLookupFor(candidates, filters);
+    return candidates.filter((template) =>
+      matchesTemplateFilter(template, filters, { versionsOfKey }),
+    );
+  }
+
+  async getPaginatedTemplates(page: number, pageSize: number): Promise<ManagedTemplate[]> {
+    return paginate(await this.getAllTemplates(), page, pageSize);
+  }
+
+  async getPaginatedFilteredTemplates(
+    filters: ManagedTemplateFilter,
+    page: number,
+    pageSize: number,
+  ): Promise<ManagedTemplate[]> {
+    return paginate(await this.getFilteredTemplates(filters), page, pageSize);
+  }
+
+  // -------------------------------------------------------------------------------------------
+  // Internals
+  // -------------------------------------------------------------------------------------------
+
+  /**
+   * The lookup `mostRecentActiveVersion` needs: every version of each candidate key.
+   *
+   * Built only when the filter actually names the field, because it costs a second search. The
+   * candidates alone are not enough — the narrowing may have excluded exactly the newer version
+   * that decides the answer — so the key's full history is fetched.
+   */
+  private async versionLookupFor(
+    candidates: ManagedTemplate[],
+    filters: ManagedTemplateFilter,
+  ): Promise<(key: string) => ManagedTemplate[]> {
+    if (!mentionsMostRecentActiveVersion(filters)) {
+      return () => [];
+    }
+
+    const keys = [...new Set(candidates.map((template) => template.key))];
+    if (keys.length === 0) {
+      return () => [];
+    }
+
+    const resources = await this.searchTemplateResources([
+      templateKindTuple(),
+      [
+        'identifier',
+        keys.map((key) => `${IDENTIFIER_SYSTEM.key}|${escapeSearchValue(key)}`).join(','),
+      ],
+    ]);
+    const byKey = new Map<string, ManagedTemplate[]>();
+    for (const template of await this.hydrate(resources)) {
+      const bucket = byKey.get(template.key);
+      if (bucket === undefined) {
+        byKey.set(template.key, [template]);
+      } else {
+        bucket.push(template);
+      }
+    }
+    return (key) => byKey.get(key) ?? [];
+  }
+
+  /** Attach the tag records behind each resource's `meta.tag`, in one read for the whole set. */
+  private async hydrate(resources: MessageDefinition[]): Promise<ManagedTemplate[]> {
+    if (resources.length === 0) {
+      return [];
+    }
+    const slugs = new Set(resources.flatMap(readTemplateTagSlugs));
+    const tagsBySlug =
+      slugs.size === 0 ? new Map<string, ManagedTemplateTag>() : indexBySlug(await this.allTags());
+    return resources.map((resource) => toManagedTemplate(resource, tagsBySlug));
+  }
+
+  private async allTags(): Promise<ManagedTemplateTag[]> {
+    return (await this.searchTagResources([tagKindTuple()])).map(toManagedTag);
+  }
+
+  private async tagsForSlugs(slugs: string[]): Promise<ManagedTemplateTag[]> {
+    const bySlug = indexBySlug(await this.allTags());
+    return slugs.flatMap((slug) => {
+      const tag = bySlug.get(slug);
+      return tag === undefined ? [] : [tag];
+    });
+  }
+
+  private async requireResource(
+    templateKey: string,
+    version: number | null,
+  ): Promise<MessageDefinition> {
+    const resources = await this.searchTemplateResources([
+      templateKindTuple(),
+      ['identifier', `${IDENTIFIER_SYSTEM.key}|${escapeSearchValue(templateKey)}`],
+    ]);
+    if (resources.length === 0) {
+      throw new ManagedTemplateNotFoundError(describeMissing(templateKey, null));
+    }
+
+    const withVersions = resources.map((resource) => ({
+      resource,
+      version: Number.parseInt(resource.version ?? '1', 10),
+    }));
+
+    if (version !== null) {
+      const match = withVersions.find((entry) => entry.version === version);
+      if (match === undefined) {
+        throw new ManagedTemplateNotFoundError(describeMissing(templateKey, version));
+      }
+      return match.resource;
+    }
+
+    // Latest by version number, not by the string FHIR stores it as: "10" sorts below "2".
+    return withVersions.reduce((latest, entry) => (entry.version > latest.version ? entry : latest))
+      .resource;
+  }
+
+  private async findTagResource(slug: string): Promise<Basic | null> {
+    const normalized = slugifyTag(slug);
+    const resources = await this.searchTagResources([
+      tagKindTuple(),
+      ['identifier', `${IDENTIFIER_SYSTEM.tagSlug}|${escapeSearchValue(normalized)}`],
+    ]);
+    return resources[0] ?? null;
+  }
+
+  private async requireTagResource(slug: string): Promise<Basic> {
+    const resource = await this.findTagResource(slug);
+    if (resource === null) {
+      throw new ManagedTemplateTagNotFoundError(`No tag with slug '${slug}' was found.`);
+    }
+    return resource;
+  }
+
+  private async insertTag(text: string, tenant: string | null): Promise<ManagedTemplateTag> {
+    const slug = await nextAvailableSlug(
+      slugifyTag(text),
+      async (candidate) => (await this.findTagResource(candidate)) !== null,
+    );
+    const created = await this.medplum.createResource(
+      buildTagResource({ text, slug, status: 'active', tenant, createdAt: new Date() }),
+    );
+    return toManagedTag(created);
+  }
+
+  /**
+   * Move every template carrying `previousSlug` onto the renamed tag.
+   *
+   * A template's `meta.tag` holds the slug, not a reference, which is what makes tag filtering a
+   * server-side query — and what means a rename has to rewrite the rows. Templates are retagged
+   * one at a time; a failure partway leaves some rows on the old slug, which
+   * `updateTag`'s caller sees as the error it is.
+   */
+  private async retagTemplates(previousSlug: string, tag: ManagedTemplateTag): Promise<void> {
+    if (previousSlug === tag.slug) {
+      return;
+    }
+    for (const resource of await this.searchTemplatesCarryingTag(previousSlug)) {
+      const slugs = readTemplateTagSlugs(resource).map((slug) =>
+        slug === previousSlug ? tag.slug : slug,
+      );
+      const tags = await this.tagsForSlugs(slugs);
+      await this.medplum.updateResource(withTemplateTags(resource, tags));
+    }
+  }
+
+  private async searchTemplatesCarryingTag(slug: string): Promise<MessageDefinition[]> {
+    return this.searchTemplateResources([
+      templateKindTuple(),
+      ['_tag', `http://vintasend.com/fhir/managed-template-tag|${escapeSearchValue(slug)}`],
+    ]);
+  }
+
+  private async searchStatusChanges(templateResourceIds: string[]): Promise<Provenance[]> {
+    if (templateResourceIds.length === 0) {
+      return [];
+    }
+    return this.searchAll<Provenance>('Provenance', [
+      [
+        'target',
+        templateResourceIds.map((id) => `MessageDefinition/${escapeSearchValue(id)}`).join(','),
+      ],
+    ]);
+  }
+
+  private async searchTemplateResources(tuples: SearchTuples): Promise<MessageDefinition[]> {
+    return this.searchAll<MessageDefinition>('MessageDefinition', tuples);
+  }
+
+  private async searchTagResources(tuples: SearchTuples): Promise<Basic[]> {
+    return this.searchAll<Basic>('Basic', tuples);
+  }
+
+  /**
+   * Every resource matching a search, paged through to the end.
+   *
+   * Bounded by `maxScan` and throwing when it is reached, rather than returning what fitted: a
+   * caller cannot tell a short page from a complete one, so silent truncation would turn a store
+   * that outgrew its bound into wrong answers instead of a fixable error.
+   */
+  private async searchAll<ResourceType>(
+    resourceType: 'MessageDefinition' | 'Basic' | 'Provenance',
+    tuples: SearchTuples,
+  ): Promise<ResourceType[]> {
+    const collected: ResourceType[] = [];
+
+    for (let offset = 0; ; offset += this.pageSize) {
+      const page = (await this.medplum.searchResources(resourceType, [
+        ...tuples,
+        ['_count', String(this.pageSize)],
+        ['_offset', String(offset)],
+      ])) as unknown as ResourceType[];
+
+      collected.push(...page);
+
+      if (page.length < this.pageSize) {
+        return collected;
+      }
+      if (collected.length >= this.maxScan) {
+        throw new Error(
+          `[MedplumTemplateManager] a ${resourceType} read passed the ${this.maxScan}-resource ` +
+            'scan limit. Narrow the filter, or raise `maxScan` if the store really is this large.',
+        );
+      }
+    }
+  }
+
+  private cleanText(text: string): string {
+    const cleaned = normalizeTagText(text);
+    if (!cleaned || !slugifyTag(cleaned)) {
+      throw new ManagedTemplateInvalidTagError(
+        `Tag text ${JSON.stringify(text)} has no characters that can be turned into a slug.`,
+      );
+    }
+    return cleaned;
+  }
+}
+
+function indexBySlug(tags: ManagedTemplateTag[]): Map<string, ManagedTemplateTag> {
+  return new Map(tags.map((tag) => [tag.slug, tag]));
+}
+
+function mentionsMostRecentActiveVersion(filter: ManagedTemplateFilter): boolean {
+  if ('and' in filter) {
+    return filter.and.some(mentionsMostRecentActiveVersion);
+  }
+  if ('or' in filter) {
+    return filter.or.some(mentionsMostRecentActiveVersion);
+  }
+  if ('not' in filter) {
+    return mentionsMostRecentActiveVersion(filter.not);
+  }
+  return filter.mostRecentActiveVersion !== undefined;
+}
+
+function describeMissing(templateKey: string, version: number | null): string {
+  if (version === null) {
+    return `No template with key '${templateKey}' was found.`;
+  }
+  return `Template '${templateKey}' has no version ${version}.`;
+}
+
+function describeError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export { deriveIsAbstract };
