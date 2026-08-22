@@ -12,14 +12,11 @@ import {
   type ManagedTemplateCreateInput,
   ManagedTemplateInvalidFilterError,
   ManagedTemplateNotFoundError,
-  type ManagedTemplateStatus,
   ManagedTemplateTagAlreadyExistsError,
   ManagedTemplateTagNotFoundError,
 } from 'vintasend-managed-templates';
 import { beforeEach, describe, expect, it } from 'vitest';
 
-import { DEFAULT_URL_PREFIX, IDENTIFIER_SYSTEM } from '../constants.js';
-import { buildTemplateResource } from '../mapping.js';
 import { MedplumTemplateManagerBackend } from '../medplum-template-manager-backend.js';
 
 function createInput(
@@ -698,95 +695,5 @@ describe('ordering by version', () => {
     await backend.createTemplate(createInput('welcome'));
 
     expect((await backend.getTemplate('welcome')).version).toBe(1);
-  });
-});
-
-describe('backfilling the derived fields', () => {
-  /**
-   * A row exactly as the previous version of this backend wrote it.
-   *
-   * Built with the real builder and then stripped of the current-version identifier, rather than
-   * hand-assembled — a hand-written fixture that drifts from `buildTemplateResource` would stop
-   * representing legacy data and start representing nothing.
-   */
-  async function withoutFlag(key: string, version: number, status: ManagedTemplateStatus) {
-    const resource = buildTemplateResource(
-      {
-        key,
-        version,
-        name: key,
-        description: '',
-        templateManagedBackend: 'medplum',
-        bodyTemplate: '<p>hi</p>',
-        subjectTemplate: 'Hi',
-        preheaderTemplate: null,
-        status,
-        tenant: null,
-        createdAt: new Date(2026, 0, version),
-        tags: [],
-      },
-      DEFAULT_URL_PREFIX,
-    );
-
-    return medplum.createResource({
-      ...resource,
-      // Unpadded, as the older backend wrote it.
-      version: String(version),
-      identifier: (resource.identifier ?? []).filter(
-        (entry) => entry.system !== IDENTIFIER_SYSTEM.currentVersion,
-      ),
-    });
-  }
-
-  it('finds nothing current in a store written before the flag existed', async () => {
-    // The migration hazard: an absent flag reads as "not current", so the whole key disappears
-    // from the default listing until something writes to it.
-    await withoutFlag('legacy', 1, 'active');
-    await withoutFlag('legacy', 2, 'active');
-
-    expect(await backend.getFilteredTemplates({ mostRecentActiveVersion: true })).toHaveLength(0);
-  });
-
-  it('stamps the right version once backfilled', async () => {
-    await withoutFlag('legacy', 1, 'active');
-    await withoutFlag('legacy', 2, 'active');
-
-    const keys = await backend.backfillDerivedFields();
-    const current = await backend.getFilteredTemplates({ mostRecentActiveVersion: true });
-
-    expect(keys).toBe(1);
-    expect(current.map((t) => `${t.key}@${t.version}`)).toEqual(['legacy@2']);
-  });
-
-  it('leaves a key with nothing active unflagged', async () => {
-    await withoutFlag('retired', 1, 'archived');
-
-    await backend.backfillDerivedFields();
-
-    expect(await backend.getFilteredTemplates({ mostRecentActiveVersion: true })).toHaveLength(0);
-  });
-
-  it('repads a version written before the padding existed', async () => {
-    // Both derived fields are retrofitted, not just the flag: a store holding '2' and
-    // '000000000010' side by side sorts them the wrong way round.
-    await withoutFlag('legacy', 2, 'active');
-    await withoutFlag('legacy', 10, 'active');
-
-    await backend.backfillDerivedFields();
-
-    const ascending = await backend.getPaginatedFilteredTemplates({ key: 'legacy' }, 1, 10, {
-      field: 'version',
-      direction: 'asc',
-    });
-    expect(ascending.map((template) => template.version)).toEqual([2, 10]);
-  });
-
-  it('is idempotent', async () => {
-    await withoutFlag('legacy', 1, 'active');
-
-    await backend.backfillDerivedFields();
-    await backend.backfillDerivedFields();
-
-    expect(await backend.getFilteredTemplates({ mostRecentActiveVersion: true })).toHaveLength(1);
   });
 });

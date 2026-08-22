@@ -122,12 +122,6 @@ export function formatFhirVersion(version: number): string {
   return digits.padStart(VERSION_SORT_WIDTH, '0');
 }
 
-/** The version with the padding this backend now writes, or the same object if it already has it. */
-export function withPaddedVersion(resource: MessageDefinition): MessageDefinition {
-  const padded = formatFhirVersion(Number.parseInt(resource.version ?? '1', 10));
-  return resource.version === padded ? resource : { ...resource, version: padded };
-}
-
 export function buildTemplateResource(
   input: TemplateResourceInput,
   urlPrefix: string,

@@ -156,7 +156,9 @@ rows, and FHIR has no group-by. It is answered anyway, by **denormalization**: e
 match — `true` and `false` both, since the flag is stored on every row rather than only the winner.
 
 This is the same trade the seam already asks every backend to make for `isAbstract`: compute at
-write time what a read cannot express.
+write time what a read cannot express. Like the padding, it is invisible outside this package —
+`ManagedTemplate` carries no such field, and the filter reads exactly as it does against any other
+backend.
 
 The cost is on the write side. Four writes can move the answer, and each recomputes the key
 afterwards:
@@ -181,44 +183,6 @@ never empty.
 
 Two concurrent updates can still both insert version `n + 1`; that is the pre-existing
 read-then-insert race, and the flag inherits it rather than adding to it.
-
-### Upgrading an existing store
-
-Two fields are derived at write time and did not exist before: the **current-version flag** and the
-**zero-padding on the version**. Neither is retrofitted by reading — an absent flag reads as *not
-current*, so `mostRecentActiveVersion: true` returns nothing for those keys, and a store holding
-both `2` and `000000000010` orders them the wrong way round.
-
-Every write repairs its own key, so the backfill is only needed for keys nothing has touched since
-the upgrade. Run it once:
-
-```ts
-await backend.backfillDerivedFields(); // → how many keys it looked at
-```
-
-It is idempotent: a key already correct costs a read and no write, so re-running it is safe and a
-partial run can just be repeated.
-
-**Dropping widens.** A listing that could not collapse to one row per key comes back with every
-version instead — visible in the result, unlike an order that was quietly ignored. Read the
-capability report before trusting a filter to have narrowed.
-
-### The one combination that throws
-
-FHIR fixes the case sensitivity of each match: the bare parameter is case-insensitive starts-with,
-`:contains` is case-insensitive substring, and `:exact` is case-sensitive equality. The capability
-vocabulary has a single global `stringLookups.caseSensitive` key rather than one per lookup, so it
-cannot express "case-sensitive equality yes, case-sensitive substring no".
-
-That one combination — `{ lookup: 'includes' | 'startsWith', caseSensitive: true }` — throws
-`ManagedTemplateInvalidFilterError` instead of being declared away. Answering it case-insensitively
-would return rows the caller excluded, which is the silent wrongness this backend no longer does.
-
-> **A caveat on case.** FHIR specifies token search and `:exact` as case-sensitive, and Medplum's
-> server implements that, which is why `stringLookups.caseSensitive` is declared `true`. But
-> `@medplum/mock` compares case-insensitively across the board, so the test suite records that
-> behaviour rather than asserting the spec's. If case-sensitive matching is load-bearing for you,
-> confirm it against a real server.
 
 ## Ordering
 
@@ -245,14 +209,16 @@ and puts v10 before v2. This backend writes the version left-padded to
 `VERSION_SORT_WIDTH` (12) digits — `000000000010` — which makes the lexicographic order the numeric
 order. Reading goes through `Number.parseInt`, so the managed template a caller sees is unchanged.
 
-Two consequences worth knowing:
+**The padding is a storage detail of this package and goes no further.** A managed template's
+`version` is a `number` everywhere the library, the composition tags and the HTTP contract deal
+with it; `formatFhirVersion` is not exported, and reading goes through `Number.parseInt`. The one
+place it is visible is a plain FHIR client reading the resource directly: `version` is an
+unconstrained string in FHIR so the padding is legal, but a reader comparing it to a literal `"1"`
+will not match, and the canonical reference becomes
+`urn:vintasend:managed-template:welcome|000000000001`.
 
-* **A plain FHIR client sees the padded string.** `version` is an unconstrained string in FHIR, so
-  this is legal, but a reader comparing it to a literal `"1"` will not match. The canonical
-  reference to a template is `url|version`, so that becomes
-  `urn:vintasend:managed-template:welcome|000000000001`.
-* **A version wider than 12 digits throws** rather than sorting wrong. That is far past any real
-  template history; the check exists because the alternative failure is silent.
+A version wider than 12 digits throws rather than sorting wrong — far past any real template
+history, but the alternative failure is silent.
 
 ### Status: not rescued by the same trick
 

@@ -30,11 +30,16 @@
  * numeric comparison on a version it stores as a string, and no ends-with. Callers drop those
  * filters — `ManagedTemplateService` does it for them.
  *
- * `mostRecentActiveVersion` is the exception, and the reason is worth knowing: it compares a row
- * against its key's other versions, which no query language here expresses, so the answer is
- * **denormalized onto each row at write time** and the filter becomes a token match. That is the
- * same trade the seam already asks every backend to make for `isAbstract`. See
- * `refreshCurrentVersion` for what maintaining it costs.
+ * Two filters are answered by **denormalization** rather than by a parameter, because the answer
+ * is computed at write time and stored on the row: `isAbstract`, which the seam asks every backend
+ * to derive, and `mostRecentActiveVersion`, which compares a row against its key's other versions.
+ * See `refreshCurrentVersion` for what maintaining the second costs.
+ *
+ * Ordering by version works the same way: FHIR stores `MessageDefinition.version` as a string, so
+ * it is written zero-padded and `_sort=version` becomes numeric.
+ *
+ * Both are storage details of this package. A managed template's `version` is a `number`
+ * everywhere outside it, and nothing in the seam knows either representation exists.
  *
  * `maxScan` still bounds the reads that are genuinely unbounded: `getAllTemplates`, the tag list,
  * and a version's status history. Paginated reads are no longer among them.
@@ -84,7 +89,6 @@ import {
   toManagedTemplate,
   toStatusHistory,
   withCurrentVersionFlag,
-  withPaddedVersion,
   withTagStatus,
   withTagText,
   withTemplateStatus,
@@ -509,39 +513,7 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
   // -------------------------------------------------------------------------------------------
 
   /**
-   * Bring a store written by an older version of this backend up to date.
-   *
-   * Two fields are derived at write time and did not exist before: the current-version flag, and
-   * the zero-padding on `MessageDefinition.version`. Neither is retrofitted by reading — an
-   * absent flag reads as *not current*, so `mostRecentActiveVersion: true` returns nothing for
-   * those keys, and an unpadded version sorts as a string, so a store holding both formats orders
-   * wrongly. Run this once after upgrading.
-   *
-   * Idempotent: a key whose flag is already right costs a read and no write, so re-running it is
-   * safe and a partial run can simply be repeated.
-   *
-   * @returns how many keys it looked at.
-   */
-  async backfillDerivedFields(): Promise<number> {
-    const resources = await this.searchTemplateResources([templateKindTuple()]);
-    const noTags = new Map<string, ManagedTemplateTag>();
-    const keys = new Set(
-      resources.map((resource) => toManagedTemplate(resource, noTags).key).filter(Boolean),
-    );
-
-    for (const key of keys) {
-      await this.refreshCurrentVersion(key);
-    }
-    return keys.size;
-  }
-
-  /**
-   * Settle the derived fields on every version of `templateKey`, writing only the rows that move.
-   *
-   * Two things are derived rather than queried: which version is current, and the zero-padding on
-   * `MessageDefinition.version` that makes `_sort=version` numeric. Both are repaired here, so a
-   * row written by an older version of this backend is brought up to date by the next write that
-   * touches its key.
+   * Recompute which version of `templateKey` is current, and write the flag where it moved.
    *
    * This is the write-side cost of denormalizing `mostRecentActiveVersion`. FHIR has no group-by,
    * so the filter cannot be a query over a key's other versions — but it can be a token match
@@ -580,15 +552,14 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
     const templates = resources.map((resource) => toManagedTemplate(resource, noTags));
     const byId = new Map(templates.map((template) => [String(template.id), template]));
 
-    // Both derived fields are settled here, so an ordinary write repairs its own key and the
-    // backfill is only needed for keys nothing has touched since the upgrade.
     const changed = resources.flatMap((resource) => {
       const template = byId.get(String(resource.id));
       if (template === undefined) {
         return [];
       }
-      const desired = withPaddedVersion(
-        withCurrentVersionFlag(resource, isMostRecentActiveVersion(template, templates)),
+      const desired = withCurrentVersionFlag(
+        resource,
+        isMostRecentActiveVersion(template, templates),
       );
       return desired === resource ? [] : [desired];
     });
