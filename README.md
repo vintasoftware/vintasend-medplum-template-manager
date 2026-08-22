@@ -127,37 +127,81 @@ taking the label off each template before removing the tag resource.
 
 ## Filtering
 
-FHIR search is an AND of parameters with no general OR and no general negation. So a filter is
-pushed down as far as it goes and **finished in memory** with the library's own evaluator.
+Every read is a FHIR query. A filter is either translated completely or refused — nothing is
+finished in memory.
 
-The result is that every filter the vocabulary defines works — `or`, `not`, `endsWith`,
-case-insensitive matching, and `mostRecentActiveVersion`, which is a comparison against a key's
-other rows that no query language expresses. `getFilterCapabilities()` returns `{}` for exactly
-that reason: a backend declares only what it *cannot* do, and this one has no filter it must
-refuse, so no caller should drop one.
+FHIR search is an AND of parameters with no general OR and no general negation, so some of the
+vocabulary has no translation. Those are **declared** rather than emulated, and
+`ManagedTemplateService` drops them before the call:
 
-What is pushed into the FHIR search, and what is left to memory:
+```ts
+service.getBackendSupportedFilterCapabilities();
+```
 
-| Pushed down | Left to the in-memory pass |
+| Declared `false` | Why |
 |---|---|
-| `key` / `templateManagedBackend`, exact and case-sensitive | the other string lookups, and any case-insensitive one |
-| `status`, `isAbstract` | `version` |
-| `includesAllTags`, `includesAnyOfTags` | `name`, `description` |
-| `createdAtRange`, `updatedAtRange` | anything inside an `or` or a `not` |
-| `mostRecentActiveVersion: true` (narrowed to active/draft) | the `mostRecentActiveVersion` comparison itself |
+| `logical.or`, `logical.not`, `logical.notNested` | FHIR search ANDs its parameters; there is no disjunction and no negation |
+| `fields.version` | `MessageDefinition.version` is a FHIR *string*, so there is no numeric comparison |
+| `fields.mostRecentActiveVersion` | It compares a row against its key's other versions. FHIR has no group-by |
+| `stringLookups.endsWith` | FHIR offers starts-with, contains and exact. There is no ends-with |
 
-Narrowing never excludes a row the filter would have kept — that is the one rule every branch of
-the translation obeys — so an unpushable filter is slower, never wrong.
+Everything else is answered by the server: `key` and `templateManagedBackend` as identifier
+tokens, `name` and `description` as FHIR string searches, `status` and `isAbstract` as tokens,
+tags through `_tag`, and both date ranges through `date` and `_lastUpdated`.
+
+**Dropping widens.** A listing that could not collapse to one row per key comes back with every
+version instead — visible in the result, unlike an order that was quietly ignored. Read the
+capability report before trusting a filter to have narrowed.
+
+### The one combination that throws
+
+FHIR fixes the case sensitivity of each match: the bare parameter is case-insensitive starts-with,
+`:contains` is case-insensitive substring, and `:exact` is case-sensitive equality. The capability
+vocabulary has a single global `stringLookups.caseSensitive` key rather than one per lookup, so it
+cannot express "case-sensitive equality yes, case-sensitive substring no".
+
+That one combination — `{ lookup: 'includes' | 'startsWith', caseSensitive: true }` — throws
+`ManagedTemplateInvalidFilterError` instead of being declared away. Answering it case-insensitively
+would return rows the caller excluded, which is the silent wrongness this backend no longer does.
+
+> **A caveat on case.** FHIR specifies token search and `:exact` as case-sensitive, and Medplum's
+> server implements that, which is why `stringLookups.caseSensitive` is declared `true`. But
+> `@medplum/mock` compares case-insensitively across the board, so the test suite records that
+> behaviour rather than asserting the spec's. If case-sensitive matching is load-bearing for you,
+> confirm it against a real server.
+
+## Ordering
+
+`getPaginatedTemplates` and `getPaginatedFilteredTemplates` take an optional `orderBy`, which
+becomes a FHIR `_sort`:
+
+| Field | `_sort` parameter | |
+|---|---|---|
+| `key` | `name` | ✅ |
+| `name` | `title` | ✅ |
+| `createdAt` | `date` | ✅ |
+| `updatedAt` | `_lastUpdated` | ✅ |
+| `version` | — | ❌ FHIR stores it as a string, so sorting puts v10 before v2 |
+| `status` | — | ❌ the managed status is an identifier, which has no sort order |
+
+Every `orderBy.*` capability defaults to `false`, so the four that work are declared explicitly and
+the two that do not are left alone. Both exclusions were established by running the sorts against
+`@medplum/mock`, not by reading the spec.
+
+Unlike a filter, an unsupported order is **refused**, not dropped: an ignored order returns exactly
+the right rows in an arbitrary sequence, and nothing downstream can tell.
+
+## Pagination
+
+A page is chosen by the server — `_count` and `_offset` on the same query that carries the filter
+and the sort. Page 500 costs what page 1 costs, and no paginated read is bounded by `maxScan`.
 
 ### The scan bound
 
-Because filters finish in memory, a read scans. `maxScan` (5000 by default) bounds it, and
-**throws** when it is reached rather than returning what fitted: a caller cannot tell a short page
-from a complete one, so silent truncation would turn a store that outgrew its bound into wrong
-answers instead of a fixable error.
-
-A template store is a vocabulary rather than an event log — hundreds of rows, not millions — so
-the default is generous. If you genuinely have more, raise it.
+`maxScan` (5000 by default) still bounds the reads that are genuinely unbounded: `getAllTemplates`,
+the tag list, and a version's status history. It **throws** when reached rather than returning what
+fitted — a caller cannot tell a short page from a complete one, so silent truncation would turn a
+store that outgrew its bound into wrong answers instead of a fixable error.
 
 ## What FHIR does not give you
 
@@ -183,10 +227,15 @@ npm run typecheck
 npm run lint
 ```
 
-Tests run against `@medplum/mock`, which evaluates real FHIR search parameters, so what passes
-here is what a Medplum server will do. Every assertion in `src/__tests__/backend.test.ts` mirrors
-one in the library's `in-memory-backend.test.ts` — the point of a seam is that two implementations
-of it are interchangeable.
+Tests run against `@medplum/mock`, which evaluates real FHIR search parameters — `_sort`,
+`_offset`, the string modifiers and `_tag` all behave as a server would. Its one known divergence
+is case: it compares case-insensitively where FHIR specifies otherwise, which the filtering
+section above records.
+
+`src/__tests__/backend.test.ts` mirrors the library's `in-memory-backend.test.ts` wherever the two
+backends agree. Where they do not, it asserts the refusal instead — two implementations of a seam
+are interchangeable only up to what each declares it can do, and that difference is the capability
+report's whole job.
 
 ## License
 

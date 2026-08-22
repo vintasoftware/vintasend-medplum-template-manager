@@ -9,6 +9,7 @@
 import { MockClient } from '@medplum/mock';
 import {
   type ManagedTemplateCreateInput,
+  ManagedTemplateInvalidFilterError,
   ManagedTemplateNotFoundError,
   ManagedTemplateTagAlreadyExistsError,
   ManagedTemplateTagNotFoundError,
@@ -346,31 +347,71 @@ describe('filtering', () => {
     await backend.createTemplate(createInput('receipt', { name: 'Receipt email' }));
   });
 
-  it('matches a bare string as a case-sensitive exact match', async () => {
+  it('matches a bare string as an exact match', async () => {
     expect(await backend.getFilteredTemplates({ key: 'welcome' })).toHaveLength(1);
-    expect(await backend.getFilteredTemplates({ key: 'Welcome' })).toHaveLength(0);
+    expect(await backend.getFilteredTemplates({ key: 'receipt' })).toHaveLength(1);
+    expect(await backend.getFilteredTemplates({ key: 'nothing-like-it' })).toHaveLength(0);
   });
 
-  it('honours every string lookup, including the ones FHIR has no modifier for', async () => {
+  it('does not confirm case sensitivity here, because the mock does not enforce it', async () => {
+    // FHIR says token search and `:exact` are case-sensitive, and Medplum's server implements
+    // that against Postgres — which is why `stringLookups.caseSensitive` is declared true. But
+    // `@medplum/mock` compares case-insensitively across the board, so asserting the negative
+    // case would only be testing the mock. Recorded rather than asserted, so the gap is visible
+    // to whoever next reads the capability report against a real server.
+    expect(await backend.getFilteredTemplates({ key: 'WELCOME' })).toHaveLength(1);
+  });
+
+  it('answers the string lookups FHIR has a modifier for', async () => {
     expect(
-      await backend.getFilteredTemplates({ name: { lookup: 'startsWith', value: 'Welcome' } }),
+      await backend.getFilteredTemplates({
+        name: { lookup: 'startsWith', value: 'Welcome', caseSensitive: false },
+      }),
     ).toHaveLength(1);
-    expect(
-      await backend.getFilteredTemplates({ name: { lookup: 'endsWith', value: 'email' } }),
-    ).toHaveLength(2);
     expect(
       await backend.getFilteredTemplates({
         name: { lookup: 'includes', value: 'RECEIPT', caseSensitive: false },
       }),
     ).toHaveLength(1);
+    expect(
+      await backend.getFilteredTemplates({ name: { lookup: 'exact', value: 'Welcome email' } }),
+    ).toHaveLength(1);
   });
 
-  it('combines fields with AND and groups with and/or/not', async () => {
+  it('refuses an ends-with, which FHIR has no modifier for', async () => {
+    // Declared `stringLookups.endsWith: false`, so a caller reading the report never sends this.
+    // Arriving anyway means the report was ignored, and the old behaviour — scanning the store
+    // and finishing the match in memory — is exactly what this backend no longer does.
+    await expect(
+      backend.getFilteredTemplates({ name: { lookup: 'endsWith', value: 'email' } }),
+    ).rejects.toThrow(ManagedTemplateInvalidFilterError);
+  });
+
+  it('refuses a case-sensitive substring, which FHIR cannot express', async () => {
+    // FHIR fixes the case sensitivity of each match: `:contains` is case-insensitive and there is
+    // no case-sensitive substring. The capability vocabulary has one global `caseSensitive` key
+    // rather than one per lookup, so this combination cannot be declared away — it throws.
+    await expect(
+      backend.getFilteredTemplates({
+        name: { lookup: 'includes', value: 'email', caseSensitive: true },
+      }),
+    ).rejects.toThrow(/case-sensitive 'includes'/);
+  });
+
+  it('combines fields with AND', async () => {
     expect(await backend.getFilteredTemplates({ key: 'welcome', status: 'draft' })).toHaveLength(1);
     expect(
-      await backend.getFilteredTemplates({ or: [{ key: 'welcome' }, { key: 'receipt' }] }),
-    ).toHaveLength(2);
-    expect(await backend.getFilteredTemplates({ not: { key: 'welcome' } })).toHaveLength(1);
+      await backend.getFilteredTemplates({ and: [{ key: 'welcome' }, { status: 'draft' }] }),
+    ).toHaveLength(1);
+  });
+
+  it('refuses or and not, which FHIR search cannot express', async () => {
+    await expect(
+      backend.getFilteredTemplates({ or: [{ key: 'welcome' }, { key: 'receipt' }] }),
+    ).rejects.toThrow(/logical\.or is false/);
+    await expect(backend.getFilteredTemplates({ not: { key: 'welcome' } })).rejects.toThrow(
+      /logical\.not is false/,
+    );
   });
 
   it('matches all of no tags and none of any of no tags', async () => {
@@ -403,48 +444,20 @@ describe('filtering', () => {
     expect(await backend.getFilteredTemplates({ isAbstract: false })).toHaveLength(2);
   });
 
-  it('keeps only the current version of each key for mostRecentActiveVersion', async () => {
-    await backend.updateTemplate('welcome', {});
-    await backend.updateTemplate('welcome', {});
-
-    const current = await backend.getFilteredTemplates({ mostRecentActiveVersion: true });
-
-    expect(current.filter((template) => template.key === 'welcome')).toHaveLength(1);
-    expect(current.find((template) => template.key === 'welcome')?.version).toBe(3);
+  it('refuses mostRecentActiveVersion, which is a comparison rather than a parameter', async () => {
+    // Answering it means finding, per key, the highest-numbered active-or-draft version. FHIR has
+    // no group-by, so this was the single biggest thing the in-memory pass was doing.
+    await expect(backend.getFilteredTemplates({ mostRecentActiveVersion: true })).rejects.toThrow(
+      /mostRecentActiveVersion/,
+    );
   });
 
-  it('drops a key whose versions are all retired', async () => {
-    await backend.createTemplateStatusUpdate({
-      templateKey: 'welcome',
-      version: 1,
-      status: 'active',
-    });
-    await backend.createTemplateStatusUpdate({
-      templateKey: 'welcome',
-      version: 1,
-      status: 'archived',
-    });
-
-    const current = await backend.getFilteredTemplates({ mostRecentActiveVersion: true });
-
-    expect(current.some((template) => template.key === 'welcome')).toBe(false);
-  });
-
-  it('treats mostRecentActiveVersion false as the exact complement', async () => {
+  it('refuses a version filter, because FHIR stores the version as a string', async () => {
     await backend.updateTemplate('welcome', {});
 
-    const older = await backend.getFilteredTemplates({ mostRecentActiveVersion: false });
-
-    expect(older.map((template) => `${template.key}@${template.version}`)).toEqual(['welcome@1']);
-  });
-
-  it('filters on a version number', async () => {
-    await backend.updateTemplate('welcome', {});
-
-    expect(await backend.getFilteredTemplates({ key: 'welcome', version: 2 })).toHaveLength(1);
-    expect(
-      await backend.getFilteredTemplates({ key: 'welcome', version: { lookup: 'gte', value: 2 } }),
-    ).toHaveLength(1);
+    await expect(backend.getFilteredTemplates({ key: 'welcome', version: 2 })).rejects.toThrow(
+      /fields\.version is false/,
+    );
   });
 
   it('narrows by status', async () => {
@@ -482,8 +495,44 @@ describe('filtering', () => {
 });
 
 describe('capabilities', () => {
-  it('declares no limitation, because in-memory evaluation leaves none', () => {
-    expect(backend.getFilterCapabilities()).toEqual({});
+  it('declares what FHIR search cannot express', () => {
+    expect(backend.getFilterCapabilities()).toMatchObject({
+      'logical.or': false,
+      'logical.not': false,
+      'logical.notNested': false,
+      'fields.version': false,
+      'fields.mostRecentActiveVersion': false,
+      'stringLookups.endsWith': false,
+    });
+  });
+
+  it('declares the four orders it can genuinely serve', () => {
+    // Every `orderBy.*` key defaults to false, so these have to be claimed explicitly.
+    expect(backend.getFilterCapabilities()).toMatchObject({
+      'orderBy.key': true,
+      'orderBy.name': true,
+      'orderBy.createdAt': true,
+      'orderBy.updatedAt': true,
+    });
+  });
+
+  it('leaves version and status unorderable', () => {
+    // `MessageDefinition.version` is a FHIR string, so `_sort=version` puts v10 before v2; the
+    // managed status lives in an identifier, which has no sort order. Both stay at the false
+    // default rather than being claimed and served wrong.
+    const capabilities = backend.getFilterCapabilities();
+
+    expect(capabilities['orderBy.version']).toBeUndefined();
+    expect(capabilities['orderBy.status']).toBeUndefined();
+  });
+
+  it('does not claim a filter it declares it cannot answer', async () => {
+    // The report and the behaviour have to agree: anything reported false must actually refuse,
+    // or the report is decoration again.
+    const capabilities = backend.getFilterCapabilities();
+
+    expect(capabilities['logical.or']).toBe(false);
+    await expect(backend.getFilteredTemplates({ or: [{ key: 'a' }] })).rejects.toThrow();
   });
 });
 

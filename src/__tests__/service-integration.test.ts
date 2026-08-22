@@ -151,7 +151,11 @@ describe('the whole stack over Medplum', () => {
     expect(result.rendered.body).toBe('v1');
   });
 
-  it('lists one row per key by default, hiding a key old versions', async () => {
+  it('lists every version, because this backend cannot collapse them', async () => {
+    // The service's default listing asks for one row per key. Medplum declares
+    // `fields.mostRecentActiveVersion: false`, so the service drops the filter and the read
+    // widens rather than failing — the extra rows are the visible consequence, and the
+    // capability report is where a caller finds out why.
     await service.createTemplate(createInput('welcome'));
     await service.updateTemplate('welcome', {});
     await service.createTemplate(createInput('receipt'));
@@ -160,6 +164,7 @@ describe('the whole stack over Medplum', () => {
 
     expect(listed.map((template) => `${template.key}@${template.version}`).sort()).toEqual([
       'receipt@1',
+      'welcome@1',
       'welcome@2',
     ]);
   });
@@ -183,11 +188,49 @@ describe('the whole stack over Medplum', () => {
     expect(history[0]?.changedBy).toBe('bruno');
   });
 
-  it('reports the backend as fully capable, so no caller drops a filter', () => {
+  it('reports the backend limitations through the service', () => {
     const capabilities = service.getBackendSupportedFilterCapabilities();
 
-    expect(capabilities['logical.or']).toBe(true);
-    expect(capabilities['fields.mostRecentActiveVersion']).toBe(true);
-    expect(capabilities['stringLookups.endsWith']).toBe(true);
+    expect(capabilities['logical.or']).toBe(false);
+    expect(capabilities['fields.mostRecentActiveVersion']).toBe(false);
+    expect(capabilities['stringLookups.endsWith']).toBe(false);
+    // Merged over the library default, so what the backend does not mention stays supported.
+    expect(capabilities['fields.key']).toBe(true);
+    expect(capabilities['logical.and']).toBe(true);
+  });
+
+  it('reports the orders the backend can serve, and only those', () => {
+    expect(service.getSupportedOrderByFields()).toEqual(['key', 'name', 'createdAt', 'updatedAt']);
+  });
+
+  it('orders a listing through the whole stack', async () => {
+    for (const key of ['charlie', 'alpha', 'bravo']) {
+      await service.createTemplate(createInput(key));
+    }
+
+    const page = await service.getPaginatedTemplates(1, 10, true, {
+      field: 'key',
+      direction: 'desc',
+    });
+
+    expect(page.map((template) => template.key)).toEqual(['charlie', 'bravo', 'alpha']);
+  });
+
+  it('refuses an order the backend cannot apply', async () => {
+    await expect(
+      service.getPaginatedTemplates(1, 10, true, { field: 'version', direction: 'asc' }),
+    ).rejects.toThrow(/orderBy\.version/);
+  });
+
+  it('pages without repeating or dropping a row', async () => {
+    for (const key of ['charlie', 'alpha', 'bravo', 'delta']) {
+      await service.createTemplate(createInput(key));
+    }
+    const order = { field: 'key', direction: 'asc' } as const;
+
+    const first = await service.getPaginatedTemplates(1, 2, true, order);
+    const second = await service.getPaginatedTemplates(2, 2, true, order);
+
+    expect([...first, ...second].map((t) => t.key)).toEqual(['alpha', 'bravo', 'charlie', 'delta']);
   });
 });

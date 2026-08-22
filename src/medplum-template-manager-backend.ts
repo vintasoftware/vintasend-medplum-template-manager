@@ -15,18 +15,25 @@
  * extension; what a query has to narrow on additionally goes in an identifier, because
  * `identifier` is a token search and every FHIR server answers those the same way.
  *
- * ## Filtering
+ * ## Filtering and ordering
  *
- * FHIR search is an AND of parameters with no general OR and no general negation, so a filter is
- * pushed down as far as it goes (see `search.ts`) and finished in memory with the library's own
- * evaluator. Every filter the vocabulary defines therefore works — including `or`, `not`, the
- * string lookups FHIR has no modifier for, and `mostRecentActiveVersion`, which is a comparison
- * against a key's other rows that no query language expresses. The cost is a scan bounded by
- * `maxScan`, which throws rather than truncating: a short page that looks complete is the one
- * failure a caller cannot detect.
+ * Every read is a FHIR query. A filter is translated completely or refused — nothing is finished
+ * in memory — and a page is chosen by the server with `_count` and `_offset` rather than by
+ * reading the store and slicing.
  *
- * That is why `getFilterCapabilities` declares nothing — a backend declares only what it *cannot*
- * do, and this one has no filter it must refuse.
+ * This backend used to work the other way: whatever FHIR could not express was evaluated in
+ * memory over the whole store, which made every filter "supported" and every listing a scan.
+ * `getFilterCapabilities` reported `{}` — no limitations — and a caller had no way to tell an
+ * indexed query from a full read, or to choose differently.
+ *
+ * What FHIR search cannot express is now declared instead: no general OR, no general negation, no
+ * numeric comparison on a version it stores as a string, no ends-with, and no
+ * `mostRecentActiveVersion`, which compares a row against its key's other versions. Callers drop
+ * those filters — `ManagedTemplateService` does it for them — and a listing that could not be
+ * collapsed to one row per key comes back with every version, which is visible in the result.
+ *
+ * `maxScan` still bounds the reads that are genuinely unbounded: `getAllTemplates`, the tag list,
+ * and a version's status history. Paginated reads are no longer among them.
  */
 
 import type { MedplumClient } from '@medplum/core';
@@ -34,12 +41,14 @@ import type { Basic, MessageDefinition, Provenance } from '@medplum/fhirtypes';
 import type { BaseLogger } from 'vintasend';
 import {
   type BaseTemplateManagerBackend,
+  MANAGED_TEMPLATE_ORDER_BY_FIELDS,
   type ManagedTemplate,
   type ManagedTemplateCreateInput,
   type ManagedTemplateFilter,
   type ManagedTemplateFilterCapabilities,
   ManagedTemplateInvalidTagError,
   ManagedTemplateNotFoundError,
+  type ManagedTemplateOrderBy,
   type ManagedTemplateStatus,
   type ManagedTemplateStatusHistory,
   type ManagedTemplateTag,
@@ -47,10 +56,9 @@ import {
   ManagedTemplateTagNotFoundError,
   type ManagedTemplateTagStatus,
   type ManagedTemplateUpdateInput,
-  matchesTemplateFilter,
   nextAvailableSlug,
   normalizeTagText,
-  paginate,
+  orderByCapabilityKey,
   slugifyTag,
 } from 'vintasend-managed-templates';
 
@@ -76,7 +84,9 @@ import {
   withTemplateTags,
 } from './mapping.js';
 import {
+  canSortBy,
   deriveSearchTuples,
+  deriveSortTuples,
   escapeSearchValue,
   type SearchTuples,
   tagKindTuple,
@@ -124,14 +134,37 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
   }
 
   /**
-   * Nothing is declared, because there is no filter this backend must refuse.
+   * What FHIR search cannot answer, declared rather than faked.
    *
-   * What FHIR search cannot express is finished in memory rather than rejected, so every field,
-   * lookup and logical group in the vocabulary is answerable. Declaring a limitation here that
-   * does not exist would have callers drop filters that work.
+   * Everything listed here was previously "supported" by reading the whole store and finishing
+   * the filter in memory. That made a listing a scan and made this report a lie: a caller could
+   * not tell an indexed query from a full read, and could not choose differently if it wanted to.
+   *
+   * The `orderBy` entries are the other half. Every `orderBy.*` key defaults to false, so the
+   * four this backend can genuinely serve have to be declared explicitly — and the two it cannot
+   * are left at the default for reasons `SORT_PARAMETER` records: FHIR stores `version` as a
+   * string, so sorting it puts v10 before v2, and the managed status lives in an identifier,
+   * which has no sort order.
    */
   getFilterCapabilities(): ManagedTemplateFilterCapabilities {
-    return {};
+    return {
+      // FHIR search ANDs its parameters. There is no general disjunction and no general negation.
+      'logical.or': false,
+      'logical.not': false,
+      'logical.notNested': false,
+      // `MessageDefinition.version` is a FHIR string, so there is no numeric comparison for it.
+      'fields.version': false,
+      // Answered by comparing a row against its key's other versions, which is not a parameter.
+      'fields.mostRecentActiveVersion': false,
+      // FHIR string search offers starts-with, contains and exact. There is no ends-with.
+      'stringLookups.endsWith': false,
+      ...Object.fromEntries(
+        MANAGED_TEMPLATE_ORDER_BY_FIELDS.filter(canSortBy).map((field) => [
+          orderByCapabilityKey(field),
+          true,
+        ]),
+      ),
+    };
   }
 
   // -------------------------------------------------------------------------------------------
@@ -428,69 +461,43 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
   }
 
   async getFilteredTemplates(filters: ManagedTemplateFilter): Promise<ManagedTemplate[]> {
-    const candidates = await this.hydrate(
-      await this.searchTemplateResources(deriveSearchTuples(filters)),
-    );
-    const versionsOfKey = await this.versionLookupFor(candidates, filters);
-    return candidates.filter((template) =>
-      matchesTemplateFilter(template, filters, { versionsOfKey }),
-    );
+    return this.hydrate(await this.searchTemplateResources(deriveSearchTuples(filters)));
   }
 
-  async getPaginatedTemplates(page: number, pageSize: number): Promise<ManagedTemplate[]> {
-    return paginate(await this.getAllTemplates(), page, pageSize);
+  async getPaginatedTemplates(
+    page: number,
+    pageSize: number,
+    orderBy?: ManagedTemplateOrderBy,
+  ): Promise<ManagedTemplate[]> {
+    return this.getPaginatedFilteredTemplates({}, page, pageSize, orderBy);
   }
 
+  /**
+   * One page, asked of FHIR as a page.
+   *
+   * The filter translates completely and the sort is a `_sort` parameter, so the server chooses
+   * the page — `_count` and `_offset` rather than reading everything and slicing. Page 500 costs
+   * what page 1 costs, and nothing here is bounded by `maxScan`.
+   */
   async getPaginatedFilteredTemplates(
     filters: ManagedTemplateFilter,
     page: number,
     pageSize: number,
+    orderBy?: ManagedTemplateOrderBy,
   ): Promise<ManagedTemplate[]> {
-    return paginate(await this.getFilteredTemplates(filters), page, pageSize);
+    const resources = (await this.medplum.searchResources('MessageDefinition', [
+      ...deriveSearchTuples(filters),
+      ...deriveSortTuples(orderBy),
+      ['_count', String(pageSize)],
+      ['_offset', String((page - 1) * pageSize)],
+    ])) as MessageDefinition[];
+
+    return this.hydrate(resources);
   }
 
   // -------------------------------------------------------------------------------------------
   // Internals
   // -------------------------------------------------------------------------------------------
-
-  /**
-   * The lookup `mostRecentActiveVersion` needs: every version of each candidate key.
-   *
-   * Built only when the filter actually names the field, because it costs a second search. The
-   * candidates alone are not enough — the narrowing may have excluded exactly the newer version
-   * that decides the answer — so the key's full history is fetched.
-   */
-  private async versionLookupFor(
-    candidates: ManagedTemplate[],
-    filters: ManagedTemplateFilter,
-  ): Promise<(key: string) => ManagedTemplate[]> {
-    if (!mentionsMostRecentActiveVersion(filters)) {
-      return () => [];
-    }
-
-    const keys = [...new Set(candidates.map((template) => template.key))];
-    if (keys.length === 0) {
-      return () => [];
-    }
-
-    const resources = await this.searchTemplateResources([
-      templateKindTuple(),
-      [
-        'identifier',
-        keys.map((key) => `${IDENTIFIER_SYSTEM.key}|${escapeSearchValue(key)}`).join(','),
-      ],
-    ]);
-    const byKey = new Map<string, ManagedTemplate[]>();
-    for (const template of await this.hydrate(resources)) {
-      const bucket = byKey.get(template.key);
-      if (bucket === undefined) {
-        byKey.set(template.key, [template]);
-      } else {
-        bucket.push(template);
-      }
-    }
-    return (key) => byKey.get(key) ?? [];
-  }
 
   /** Attach the tag records behind each resource's `meta.tag`, in one read for the whole set. */
   private async hydrate(resources: MessageDefinition[]): Promise<ManagedTemplate[]> {
@@ -668,19 +675,6 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
 
 function indexBySlug(tags: ManagedTemplateTag[]): Map<string, ManagedTemplateTag> {
   return new Map(tags.map((tag) => [tag.slug, tag]));
-}
-
-function mentionsMostRecentActiveVersion(filter: ManagedTemplateFilter): boolean {
-  if ('and' in filter) {
-    return filter.and.some(mentionsMostRecentActiveVersion);
-  }
-  if ('or' in filter) {
-    return filter.or.some(mentionsMostRecentActiveVersion);
-  }
-  if ('not' in filter) {
-    return mentionsMostRecentActiveVersion(filter.not);
-  }
-  return filter.mostRecentActiveVersion !== undefined;
 }
 
 function describeMissing(templateKey: string, version: number | null): string {
