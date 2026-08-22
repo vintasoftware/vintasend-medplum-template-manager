@@ -65,7 +65,10 @@ describe('versions', () => {
 
     expect(resource?.resourceType).toBe('MessageDefinition');
     expect(resource?.url).toBe('urn:vintasend:managed-template:welcome');
-    expect(resource?.version).toBe('1');
+    // Left-padded so `_sort=version` is numeric rather than lexicographic. This is the one place
+    // the padding is visible to a plain FHIR client — `version` is a string in FHIR and the spec
+    // puts no format on it, but a reader comparing it to a literal '1' has to know.
+    expect(resource?.version).toBe('000000000001');
     expect(resource?.name).toBe('welcome');
     expect(resource?.title).toBe('Welcome email');
     expect(resource?.status).toBe('draft');
@@ -608,24 +611,26 @@ describe('capabilities', () => {
     expect(backend.getFilterCapabilities()).not.toHaveProperty('fields.mostRecentActiveVersion');
   });
 
-  it('declares the four orders it can genuinely serve', () => {
+  it('declares the five orders it can genuinely serve', () => {
     // Every `orderBy.*` key defaults to false, so these have to be claimed explicitly.
     expect(backend.getFilterCapabilities()).toMatchObject({
       'orderBy.key': true,
       'orderBy.name': true,
+      'orderBy.version': true,
       'orderBy.createdAt': true,
       'orderBy.updatedAt': true,
     });
   });
 
-  it('leaves version and status unorderable', () => {
-    // `MessageDefinition.version` is a FHIR string, so `_sort=version` puts v10 before v2; the
-    // managed status lives in an identifier, which has no sort order. Both stay at the false
-    // default rather than being claimed and served wrong.
-    const capabilities = backend.getFilterCapabilities();
+  it('claims version, which the zero-padded string makes sortable', () => {
+    expect(backend.getFilterCapabilities()['orderBy.version']).toBe(true);
+  });
 
-    expect(capabilities['orderBy.version']).toBeUndefined();
-    expect(capabilities['orderBy.status']).toBeUndefined();
+  it('leaves status unorderable, which padding cannot rescue', () => {
+    // The managed status lives in an identifier, and tokens have no sort order. The only sortable
+    // status field is FHIR's own, into which `inactive` and `archived` both map as `retired` — a
+    // sort that cannot tell two of the four statuses apart is worse than no sort.
+    expect(backend.getFilterCapabilities()['orderBy.status']).toBeUndefined();
   });
 
   it('does not claim a filter it declares it cannot answer', async () => {
@@ -658,7 +663,45 @@ describe('scan limit', () => {
   });
 });
 
-describe('backfilling the current-version flag', () => {
+describe('ordering by version', () => {
+  it('puts v10 after v2, which an unpadded string sort would not', async () => {
+    await backend.createTemplate(createInput('welcome'));
+    for (let i = 0; i < 10; i += 1) {
+      await backend.updateTemplate('welcome', {});
+    }
+
+    const ascending = await backend.getPaginatedFilteredTemplates({ key: 'welcome' }, 1, 20, {
+      field: 'version',
+      direction: 'asc',
+    });
+
+    expect(ascending.map((template) => template.version)).toEqual([
+      1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+    ]);
+  });
+
+  it('reverses cleanly', async () => {
+    await backend.createTemplate(createInput('welcome'));
+    for (let i = 0; i < 10; i += 1) {
+      await backend.updateTemplate('welcome', {});
+    }
+
+    const descending = await backend.getPaginatedFilteredTemplates({ key: 'welcome' }, 1, 3, {
+      field: 'version',
+      direction: 'desc',
+    });
+
+    expect(descending.map((template) => template.version)).toEqual([11, 10, 9]);
+  });
+
+  it('reads the padded version back as a plain number', async () => {
+    await backend.createTemplate(createInput('welcome'));
+
+    expect((await backend.getTemplate('welcome')).version).toBe(1);
+  });
+});
+
+describe('backfilling the derived fields', () => {
   /**
    * A row exactly as the previous version of this backend wrote it.
    *
@@ -687,6 +730,8 @@ describe('backfilling the current-version flag', () => {
 
     return medplum.createResource({
       ...resource,
+      // Unpadded, as the older backend wrote it.
+      version: String(version),
       identifier: (resource.identifier ?? []).filter(
         (entry) => entry.system !== IDENTIFIER_SYSTEM.currentVersion,
       ),
@@ -706,7 +751,7 @@ describe('backfilling the current-version flag', () => {
     await withoutFlag('legacy', 1, 'active');
     await withoutFlag('legacy', 2, 'active');
 
-    const keys = await backend.backfillCurrentVersions();
+    const keys = await backend.backfillDerivedFields();
     const current = await backend.getFilteredTemplates({ mostRecentActiveVersion: true });
 
     expect(keys).toBe(1);
@@ -716,16 +761,31 @@ describe('backfilling the current-version flag', () => {
   it('leaves a key with nothing active unflagged', async () => {
     await withoutFlag('retired', 1, 'archived');
 
-    await backend.backfillCurrentVersions();
+    await backend.backfillDerivedFields();
 
     expect(await backend.getFilteredTemplates({ mostRecentActiveVersion: true })).toHaveLength(0);
+  });
+
+  it('repads a version written before the padding existed', async () => {
+    // Both derived fields are retrofitted, not just the flag: a store holding '2' and
+    // '000000000010' side by side sorts them the wrong way round.
+    await withoutFlag('legacy', 2, 'active');
+    await withoutFlag('legacy', 10, 'active');
+
+    await backend.backfillDerivedFields();
+
+    const ascending = await backend.getPaginatedFilteredTemplates({ key: 'legacy' }, 1, 10, {
+      field: 'version',
+      direction: 'asc',
+    });
+    expect(ascending.map((template) => template.version)).toEqual([2, 10]);
   });
 
   it('is idempotent', async () => {
     await withoutFlag('legacy', 1, 'active');
 
-    await backend.backfillCurrentVersions();
-    await backend.backfillCurrentVersions();
+    await backend.backfillDerivedFields();
+    await backend.backfillDerivedFields();
 
     expect(await backend.getFilteredTemplates({ mostRecentActiveVersion: true })).toHaveLength(1);
   });

@@ -78,13 +78,13 @@ import {
   buildTagResource,
   buildTemplateResource,
   deriveIsAbstract,
-  readCurrentVersionFlag,
   readTemplateTagSlugs,
   statusChangeTargetId,
   toManagedTag,
   toManagedTemplate,
   toStatusHistory,
   withCurrentVersionFlag,
+  withPaddedVersion,
   withTagStatus,
   withTagText,
   withTemplateStatus,
@@ -509,19 +509,20 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
   // -------------------------------------------------------------------------------------------
 
   /**
-   * Stamp the current-version flag across a store written before it existed.
+   * Bring a store written by an older version of this backend up to date.
    *
-   * The flag is maintained from here on by every write that can move it, but a template already
-   * in the store has no flag at all — and an absent flag reads as *not current*, so
-   * `mostRecentActiveVersion: true` would return nothing for those keys until each one happened
-   * to be written again. Run this once after upgrading.
+   * Two fields are derived at write time and did not exist before: the current-version flag, and
+   * the zero-padding on `MessageDefinition.version`. Neither is retrofitted by reading — an
+   * absent flag reads as *not current*, so `mostRecentActiveVersion: true` returns nothing for
+   * those keys, and an unpadded version sorts as a string, so a store holding both formats orders
+   * wrongly. Run this once after upgrading.
    *
    * Idempotent: a key whose flag is already right costs a read and no write, so re-running it is
    * safe and a partial run can simply be repeated.
    *
    * @returns how many keys it looked at.
    */
-  async backfillCurrentVersions(): Promise<number> {
+  async backfillDerivedFields(): Promise<number> {
     const resources = await this.searchTemplateResources([templateKindTuple()]);
     const noTags = new Map<string, ManagedTemplateTag>();
     const keys = new Set(
@@ -535,7 +536,12 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
   }
 
   /**
-   * Recompute which version of `templateKey` is current, and write the flag where it moved.
+   * Settle the derived fields on every version of `templateKey`, writing only the rows that move.
+   *
+   * Two things are derived rather than queried: which version is current, and the zero-padding on
+   * `MessageDefinition.version` that makes `_sort=version` numeric. Both are repaired here, so a
+   * row written by an older version of this backend is brought up to date by the next write that
+   * touches its key.
    *
    * This is the write-side cost of denormalizing `mostRecentActiveVersion`. FHIR has no group-by,
    * so the filter cannot be a query over a key's other versions — but it can be a token match
@@ -574,32 +580,30 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
     const templates = resources.map((resource) => toManagedTemplate(resource, noTags));
     const byId = new Map(templates.map((template) => [String(template.id), template]));
 
-    const moved = resources.filter((resource) => {
+    // Both derived fields are settled here, so an ordinary write repairs its own key and the
+    // backfill is only needed for keys nothing has touched since the upgrade.
+    const changed = resources.flatMap((resource) => {
       const template = byId.get(String(resource.id));
       if (template === undefined) {
-        return false;
+        return [];
       }
-      const shouldBeCurrent = isMostRecentActiveVersion(template, templates);
-      return readCurrentVersionFlag(resource) !== shouldBeCurrent;
+      const desired = withPaddedVersion(
+        withCurrentVersionFlag(resource, isMostRecentActiveVersion(template, templates)),
+      );
+      return desired === resource ? [] : [desired];
     });
 
-    if (moved.length === 0) {
+    if (changed.length === 0) {
       return;
     }
 
     await this.medplum.executeBatch({
       resourceType: 'Bundle',
       type: 'transaction',
-      entry: moved.map((resource) => {
-        const template = byId.get(String(resource.id)) as ManagedTemplate;
-        return {
-          request: { method: 'PUT' as const, url: `MessageDefinition/${resource.id}` },
-          resource: withCurrentVersionFlag(
-            resource,
-            isMostRecentActiveVersion(template, templates),
-          ),
-        };
-      }),
+      entry: changed.map((resource) => ({
+        request: { method: 'PUT' as const, url: `MessageDefinition/${resource.id}` },
+        resource,
+      })),
     });
   }
 

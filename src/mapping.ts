@@ -35,6 +35,7 @@ import {
   RESOURCE_KIND_SYSTEM,
   TEMPLATE_EVENT_URI,
   TEMPLATE_TAG_SYSTEM,
+  VERSION_SORT_WIDTH,
 } from './constants.js';
 
 /**
@@ -102,6 +103,31 @@ export function deriveIsAbstract(sources: TemplateSources): boolean {
   }
 }
 
+/**
+ * The version as FHIR should store it: left-padded so a lexicographic sort is a numeric one.
+ *
+ * Reading goes through `Number.parseInt`, which ignores the padding, so the managed template a
+ * caller sees is unchanged.
+ *
+ * @throws RangeError if the version will not fit, which would silently sort wrong.
+ */
+export function formatFhirVersion(version: number): string {
+  const digits = String(version);
+  if (digits.length > VERSION_SORT_WIDTH) {
+    throw new RangeError(
+      `Version ${version} needs more than ${VERSION_SORT_WIDTH} digits, which would break the ` +
+        'lexicographic ordering `_sort=version` relies on.',
+    );
+  }
+  return digits.padStart(VERSION_SORT_WIDTH, '0');
+}
+
+/** The version with the padding this backend now writes, or the same object if it already has it. */
+export function withPaddedVersion(resource: MessageDefinition): MessageDefinition {
+  const padded = formatFhirVersion(Number.parseInt(resource.version ?? '1', 10));
+  return resource.version === padded ? resource : { ...resource, version: padded };
+}
+
 export function buildTemplateResource(
   input: TemplateResourceInput,
   urlPrefix: string,
@@ -111,7 +137,7 @@ export function buildTemplateResource(
   return {
     resourceType: 'MessageDefinition',
     url: `${urlPrefix}${input.key}`,
-    version: String(input.version),
+    version: formatFhirVersion(input.version),
     // Computer-friendly name, which for a managed template is its key.
     name: input.key,
     title: input.name,

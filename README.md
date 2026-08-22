@@ -184,12 +184,16 @@ read-then-insert race, and the flag inherits it rather than adding to it.
 
 ### Upgrading an existing store
 
-A row written before this flag existed does not carry it, and an absent flag reads as *not
-current* — so `mostRecentActiveVersion: true` returns nothing for those keys until something
-writes to them. Run the backfill once after upgrading:
+Two fields are derived at write time and did not exist before: the **current-version flag** and the
+**zero-padding on the version**. Neither is retrofitted by reading — an absent flag reads as *not
+current*, so `mostRecentActiveVersion: true` returns nothing for those keys, and a store holding
+both `2` and `000000000010` orders them the wrong way round.
+
+Every write repairs its own key, so the backfill is only needed for keys nothing has touched since
+the upgrade. Run it once:
 
 ```ts
-await backend.backfillCurrentVersions(); // → how many keys it looked at
+await backend.backfillDerivedFields(); // → how many keys it looked at
 ```
 
 It is idempotent: a key already correct costs a read and no write, so re-running it is safe and a
@@ -227,12 +231,40 @@ becomes a FHIR `_sort`:
 | `name` | `title` | ✅ |
 | `createdAt` | `date` | ✅ |
 | `updatedAt` | `_lastUpdated` | ✅ |
-| `version` | — | ❌ FHIR stores it as a string, so sorting puts v10 before v2 |
-| `status` | — | ❌ the managed status is an identifier, which has no sort order |
+| `version` | `version` | ✅ via zero-padding — see below |
+| `status` | — | ❌ see below |
 
-Every `orderBy.*` capability defaults to `false`, so the four that work are declared explicitly and
-the two that do not are left alone. Both exclusions were established by running the sorts against
-`@medplum/mock`, not by reading the spec.
+Every `orderBy.*` capability defaults to `false`, so the five that work are declared explicitly and
+the one that does not is left alone. Every entry in that table was established by running the sort,
+not by reading the spec — `_sort=version` looked fine until it was given versions 10, 2 and 3.
+
+### Version: zero-padded so the string sort is a numeric one
+
+FHIR stores `MessageDefinition.version` as a *string*, so `_sort=version` compares lexicographically
+and puts v10 before v2. This backend writes the version left-padded to
+`VERSION_SORT_WIDTH` (12) digits — `000000000010` — which makes the lexicographic order the numeric
+order. Reading goes through `Number.parseInt`, so the managed template a caller sees is unchanged.
+
+Two consequences worth knowing:
+
+* **A plain FHIR client sees the padded string.** `version` is an unconstrained string in FHIR, so
+  this is legal, but a reader comparing it to a literal `"1"` will not match. The canonical
+  reference to a template is `url|version`, so that becomes
+  `urn:vintasend:managed-template:welcome|000000000001`.
+* **A version wider than 12 digits throws** rather than sorting wrong. That is far past any real
+  template history; the check exists because the alternative failure is silent.
+
+### Status: not rescued by the same trick
+
+The managed status lives in an identifier, and token parameters have no sort order. The only
+sortable status field is FHIR's own `MessageDefinition.status` — and `inactive` and `archived` both
+map into it as `retired`, so it cannot tell two of the four statuses apart. Padding does not help,
+because there is no spare sortable field to pad *into*: `name`, `title`, `version`, `date` and
+`_lastUpdated` all already carry real data, and a sortable rank in an extension would need a custom
+`SearchParameter`, which is server configuration a library cannot assume.
+
+A sort that silently confuses `inactive` with `archived` is worse than no sort, so the capability
+stays false.
 
 Unlike a filter, an unsupported order is **refused**, not dropped: an ignored order returns exactly
 the right rows in an arbitrary sequence, and nothing downstream can tell.

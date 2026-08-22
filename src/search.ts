@@ -73,11 +73,14 @@ export function tagKindTuple(): string[] {
  * The two absences are load-bearing, and both were established by running the sorts rather than
  * by reading the spec:
  *
- * * **`version`** is `MessageDefinition.version`, a *string* in FHIR. `_sort=version` orders it
- *   lexicographically, which puts v10 before v2. There is no numeric sort to fall back on, so the
- *   capability is declared false rather than served wrong.
- * * **`status`** is a managed status kept in an identifier, not `MessageDefinition.status`. Token
- *   parameters have no meaningful sort order.
+ * **`version`** is `MessageDefinition.version`, a *string* in FHIR, so `_sort=version` compares it
+ * lexicographically. That is answerable anyway: the version is written left-padded with zeros, so
+ * the lexicographic order *is* the numeric one. See `formatFhirVersion`.
+ *
+ * **`status`** is the one that stays out, and padding cannot rescue it. The managed status lives
+ * in an identifier, and token parameters have no sort order; the only sortable status field is
+ * FHIR's own `MessageDefinition.status`, into which `inactive` and `archived` both map as
+ * `retired`. A sort that cannot tell two of the four statuses apart is worse than no sort.
  */
 const SORT_PARAMETER: Record<ManagedTemplateOrderBy['field'], string | null> = {
   // `MessageDefinition.name` holds the template key; `title` holds its human name.
@@ -85,7 +88,7 @@ const SORT_PARAMETER: Record<ManagedTemplateOrderBy['field'], string | null> = {
   name: 'title',
   createdAt: 'date',
   updatedAt: '_lastUpdated',
-  version: null,
+  version: 'version',
   status: null,
 };
 

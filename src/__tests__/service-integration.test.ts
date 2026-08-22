@@ -196,7 +196,13 @@ describe('the whole stack over Medplum', () => {
   });
 
   it('reports the orders the backend can serve, and only those', () => {
-    expect(service.getSupportedOrderByFields()).toEqual(['key', 'name', 'createdAt', 'updatedAt']);
+    expect(service.getSupportedOrderByFields()).toEqual([
+      'key',
+      'name',
+      'version',
+      'createdAt',
+      'updatedAt',
+    ]);
   });
 
   it('orders a listing through the whole stack', async () => {
@@ -214,8 +220,8 @@ describe('the whole stack over Medplum', () => {
 
   it('refuses an order the backend cannot apply', async () => {
     await expect(
-      service.getPaginatedTemplates(1, 10, true, { field: 'version', direction: 'asc' }),
-    ).rejects.toThrow(/orderBy\.version/);
+      service.getPaginatedTemplates(1, 10, true, { field: 'status', direction: 'asc' }),
+    ).rejects.toThrow(/orderBy\.status/);
   });
 
   it('pages without repeating or dropping a row', async () => {

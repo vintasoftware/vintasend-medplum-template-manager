@@ -79,5 +79,18 @@ export const DEFAULT_URL_PREFIX = 'urn:vintasend:managed-template:';
  */
 export const DEFAULT_MAX_SCAN = 5000;
 
+/**
+ * How many digits `MessageDefinition.version` is padded to.
+ *
+ * FHIR stores the version as a *string*, so `_sort=version` compares it lexicographically and puts
+ * v10 before v2. Left-padding with zeros makes the lexicographic order the numeric one, which is
+ * what lets this backend offer `orderBy.version` at all.
+ *
+ * Twelve digits is far past any real template history and keeps the padded value comfortably
+ * inside a FHIR string. A version wider than this would sort wrong rather than fail, so
+ * `formatFhirVersion` refuses it instead.
+ */
+export const VERSION_SORT_WIDTH = 12;
+
 /** Medplum caps a single search page at 1000. */
 export const SEARCH_PAGE_SIZE = 1000;
