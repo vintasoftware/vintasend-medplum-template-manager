@@ -127,37 +127,125 @@ taking the label off each template before removing the tag resource.
 
 ## Filtering
 
-FHIR search is an AND of parameters with no general OR and no general negation. So a filter is
-pushed down as far as it goes and **finished in memory** with the library's own evaluator.
+Every read is a FHIR query. A filter is either translated completely or refused — nothing is
+finished in memory.
 
-The result is that every filter the vocabulary defines works — `or`, `not`, `endsWith`,
-case-insensitive matching, and `mostRecentActiveVersion`, which is a comparison against a key's
-other rows that no query language expresses. `getFilterCapabilities()` returns `{}` for exactly
-that reason: a backend declares only what it *cannot* do, and this one has no filter it must
-refuse, so no caller should drop one.
+FHIR search is an AND of parameters with no general OR and no general negation, so some of the
+vocabulary has no translation. Those are **declared** rather than emulated, and
+`ManagedTemplateService` drops them before the call:
 
-What is pushed into the FHIR search, and what is left to memory:
+```ts
+service.getBackendSupportedFilterCapabilities();
+```
 
-| Pushed down | Left to the in-memory pass |
+| Declared `false` | Why |
 |---|---|
-| `key` / `templateManagedBackend`, exact and case-sensitive | the other string lookups, and any case-insensitive one |
-| `status`, `isAbstract` | `version` |
-| `includesAllTags`, `includesAnyOfTags` | `name`, `description` |
-| `createdAtRange`, `updatedAtRange` | anything inside an `or` or a `not` |
-| `mostRecentActiveVersion: true` (narrowed to active/draft) | the `mostRecentActiveVersion` comparison itself |
+| `logical.or`, `logical.not`, `logical.notNested` | FHIR search ANDs its parameters; there is no disjunction and no negation |
+| `fields.version` | `MessageDefinition.version` is a FHIR *string*, so there is no numeric comparison |
+| `stringLookups.endsWith` | FHIR offers starts-with, contains and exact. There is no ends-with |
 
-Narrowing never excludes a row the filter would have kept — that is the one rule every branch of
-the translation obeys — so an unpushable filter is slower, never wrong.
+Everything else is answered by the server: `key` and `templateManagedBackend` as identifier
+tokens, `name` and `description` as FHIR string searches, `status` and `isAbstract` as tokens,
+tags through `_tag`, and both date ranges through `date` and `_lastUpdated`.
+
+### `mostRecentActiveVersion`, without a group-by
+
+"The highest-numbered active-or-draft version of each key" is a comparison against a key's *other*
+rows, and FHIR has no group-by. It is answered anyway, by **denormalization**: each row carries a
+`current-version` identifier saying whether it is the one, so the filter is an ordinary token
+match — `true` and `false` both, since the flag is stored on every row rather than only the winner.
+
+This is the same trade the seam already asks every backend to make for `isAbstract`: compute at
+write time what a read cannot express. Like the padding, it is invisible outside this package —
+`ManagedTemplate` carries no such field, and the filter reads exactly as it does against any other
+backend.
+
+The cost is on the write side. Four writes can move the answer, and each recomputes the key
+afterwards:
+
+| Write | How the answer moves |
+|---|---|
+| `createTemplate` | a new key's only version becomes current |
+| `updateTemplate` | the inserted draft supersedes the version it was copied from |
+| `deleteTemplate` | deleting the current version promotes the next one down |
+| status change | retiring the current version promotes another; the flag can move *down* |
+
+The winner is decided by the library's own `isMostRecentActiveVersion`, not by a rule re-derived
+here, so the stored flag cannot come to mean something different from the filter. One test asserts
+the two agree over a whole store.
+
+**A recompute is one search and at most two writes**, and the writes go in a single FHIR
+transaction bundle, so a listing never shows a key twice. New rows are written *unflagged* and
+promoted afterwards for the same reason: a new version that arrived already current would double
+its key. What remains is a window between the write that moved the answer and the recompute, during
+which the listing shows the **previous** current version — stale by one write, never doubled and
+never empty.
+
+Two concurrent updates can still both insert version `n + 1`; that is the pre-existing
+read-then-insert race, and the flag inherits it rather than adding to it.
+
+## Ordering
+
+`getPaginatedTemplates` and `getPaginatedFilteredTemplates` take an optional `orderBy`, which
+becomes a FHIR `_sort`:
+
+| Field | `_sort` parameter | |
+|---|---|---|
+| `key` | `name` | ✅ |
+| `name` | `title` | ✅ |
+| `createdAt` | `date` | ✅ |
+| `updatedAt` | `_lastUpdated` | ✅ |
+| `version` | `version` | ✅ via zero-padding — see below |
+| `status` | — | ❌ see below |
+
+Every `orderBy.*` capability defaults to `false`, so the five that work are declared explicitly and
+the one that does not is left alone. Every entry in that table was established by running the sort,
+not by reading the spec — `_sort=version` looked fine until it was given versions 10, 2 and 3.
+
+### Version: zero-padded so the string sort is a numeric one
+
+FHIR stores `MessageDefinition.version` as a *string*, so `_sort=version` compares lexicographically
+and puts v10 before v2. This backend writes the version left-padded to
+`VERSION_SORT_WIDTH` (12) digits — `000000000010` — which makes the lexicographic order the numeric
+order. Reading goes through `Number.parseInt`, so the managed template a caller sees is unchanged.
+
+**The padding is a storage detail of this package and goes no further.** A managed template's
+`version` is a `number` everywhere the library, the composition tags and the HTTP contract deal
+with it; `formatFhirVersion` is not exported, and reading goes through `Number.parseInt`. The one
+place it is visible is a plain FHIR client reading the resource directly: `version` is an
+unconstrained string in FHIR so the padding is legal, but a reader comparing it to a literal `"1"`
+will not match, and the canonical reference becomes
+`urn:vintasend:managed-template:welcome|000000000001`.
+
+A version wider than 12 digits throws rather than sorting wrong — far past any real template
+history, but the alternative failure is silent.
+
+### Status: not rescued by the same trick
+
+The managed status lives in an identifier, and token parameters have no sort order. The only
+sortable status field is FHIR's own `MessageDefinition.status` — and `inactive` and `archived` both
+map into it as `retired`, so it cannot tell two of the four statuses apart. Padding does not help,
+because there is no spare sortable field to pad *into*: `name`, `title`, `version`, `date` and
+`_lastUpdated` all already carry real data, and a sortable rank in an extension would need a custom
+`SearchParameter`, which is server configuration a library cannot assume.
+
+A sort that silently confuses `inactive` with `archived` is worse than no sort, so the capability
+stays false.
+
+Unlike a filter, an unsupported order is **refused**, not dropped: an ignored order returns exactly
+the right rows in an arbitrary sequence, and nothing downstream can tell.
+
+## Pagination
+
+A page is chosen by the server — `_count` and `_offset` on the same query that carries the filter
+and the sort. Page 500 costs what page 1 costs, and no paginated read is bounded by `maxScan`.
 
 ### The scan bound
 
-Because filters finish in memory, a read scans. `maxScan` (5000 by default) bounds it, and
-**throws** when it is reached rather than returning what fitted: a caller cannot tell a short page
-from a complete one, so silent truncation would turn a store that outgrew its bound into wrong
-answers instead of a fixable error.
-
-A template store is a vocabulary rather than an event log — hundreds of rows, not millions — so
-the default is generous. If you genuinely have more, raise it.
+`maxScan` (5000 by default) still bounds the reads that are genuinely unbounded: `getAllTemplates`,
+the tag list, and a version's status history. It **throws** when reached rather than returning what
+fitted — a caller cannot tell a short page from a complete one, so silent truncation would turn a
+store that outgrew its bound into wrong answers instead of a fixable error.
 
 ## What FHIR does not give you
 
@@ -183,10 +271,15 @@ npm run typecheck
 npm run lint
 ```
 
-Tests run against `@medplum/mock`, which evaluates real FHIR search parameters, so what passes
-here is what a Medplum server will do. Every assertion in `src/__tests__/backend.test.ts` mirrors
-one in the library's `in-memory-backend.test.ts` — the point of a seam is that two implementations
-of it are interchangeable.
+Tests run against `@medplum/mock`, which evaluates real FHIR search parameters — `_sort`,
+`_offset`, the string modifiers and `_tag` all behave as a server would. Its one known divergence
+is case: it compares case-insensitively where FHIR specifies otherwise, which the filtering
+section above records.
+
+`src/__tests__/backend.test.ts` mirrors the library's `in-memory-backend.test.ts` wherever the two
+backends agree. Where they do not, it asserts the refusal instead — two implementations of a seam
+are interchangeable only up to what each declares it can do, and that difference is the capability
+report's whole job.
 
 ## License
 

@@ -35,6 +35,7 @@ import {
   RESOURCE_KIND_SYSTEM,
   TEMPLATE_EVENT_URI,
   TEMPLATE_TAG_SYSTEM,
+  VERSION_SORT_WIDTH,
 } from './constants.js';
 
 /**
@@ -102,6 +103,25 @@ export function deriveIsAbstract(sources: TemplateSources): boolean {
   }
 }
 
+/**
+ * The version as FHIR should store it: left-padded so a lexicographic sort is a numeric one.
+ *
+ * Reading goes through `Number.parseInt`, which ignores the padding, so the managed template a
+ * caller sees is unchanged.
+ *
+ * @throws RangeError if the version will not fit, which would silently sort wrong.
+ */
+export function formatFhirVersion(version: number): string {
+  const digits = String(version);
+  if (digits.length > VERSION_SORT_WIDTH) {
+    throw new RangeError(
+      `Version ${version} needs more than ${VERSION_SORT_WIDTH} digits, which would break the ` +
+        'lexicographic ordering `_sort=version` relies on.',
+    );
+  }
+  return digits.padStart(VERSION_SORT_WIDTH, '0');
+}
+
 export function buildTemplateResource(
   input: TemplateResourceInput,
   urlPrefix: string,
@@ -111,7 +131,7 @@ export function buildTemplateResource(
   return {
     resourceType: 'MessageDefinition',
     url: `${urlPrefix}${input.key}`,
-    version: String(input.version),
+    version: formatFhirVersion(input.version),
     // Computer-friendly name, which for a managed template is its key.
     name: input.key,
     title: input.name,
@@ -126,6 +146,10 @@ export function buildTemplateResource(
       identifier(IDENTIFIER_SYSTEM.status, input.status),
       identifier(IDENTIFIER_SYSTEM.backend, input.templateManagedBackend),
       identifier(IDENTIFIER_SYSTEM.abstract, String(abstract)),
+      // Always false on a fresh resource. `refreshCurrentVersion` promotes the right row once the
+      // write has landed, so a new version never briefly shares "current" with the one it
+      // supersedes — during that window the listing is one version stale rather than doubled.
+      identifier(IDENTIFIER_SYSTEM.currentVersion, 'false'),
       ...(input.tenant === null ? [] : [identifier(IDENTIFIER_SYSTEM.tenant, input.tenant)]),
     ],
     meta: {
@@ -248,6 +272,33 @@ export function withTemplateTags(
 }
 
 /** Move a resource to a managed status, keeping the FHIR summary field in step. */
+/**
+ * The resource with its current-version flag set, or the same object when it already agrees.
+ *
+ * Returning the input unchanged is what lets `refreshCurrentVersion` write only the rows that
+ * actually move.
+ */
+export function withCurrentVersionFlag(
+  resource: MessageDefinition,
+  isCurrent: boolean,
+): MessageDefinition {
+  if (readCurrentVersionFlag(resource) === isCurrent) {
+    return resource;
+  }
+  const identifiers = (resource.identifier ?? []).filter(
+    (entry) => entry.system !== IDENTIFIER_SYSTEM.currentVersion,
+  );
+  return {
+    ...resource,
+    identifier: [...identifiers, identifier(IDENTIFIER_SYSTEM.currentVersion, String(isCurrent))],
+  };
+}
+
+/** A resource written before this flag existed reads as not current, which a refresh corrects. */
+export function readCurrentVersionFlag(resource: MessageDefinition): boolean {
+  return readIdentifier(resource.identifier, IDENTIFIER_SYSTEM.currentVersion) === 'true';
+}
+
 export function withTemplateStatus(
   resource: MessageDefinition,
   status: ManagedTemplateStatus,

@@ -183,11 +183,56 @@ describe('the whole stack over Medplum', () => {
     expect(history[0]?.changedBy).toBe('bruno');
   });
 
-  it('reports the backend as fully capable, so no caller drops a filter', () => {
+  it('reports the backend limitations through the service', () => {
     const capabilities = service.getBackendSupportedFilterCapabilities();
 
-    expect(capabilities['logical.or']).toBe(true);
+    expect(capabilities['logical.or']).toBe(false);
+    // Denormalized onto each row at write time, so the default listing still collapses.
     expect(capabilities['fields.mostRecentActiveVersion']).toBe(true);
-    expect(capabilities['stringLookups.endsWith']).toBe(true);
+    expect(capabilities['stringLookups.endsWith']).toBe(false);
+    // Merged over the library default, so what the backend does not mention stays supported.
+    expect(capabilities['fields.key']).toBe(true);
+    expect(capabilities['logical.and']).toBe(true);
+  });
+
+  it('reports the orders the backend can serve, and only those', () => {
+    expect(service.getSupportedOrderByFields()).toEqual([
+      'key',
+      'name',
+      'version',
+      'createdAt',
+      'updatedAt',
+    ]);
+  });
+
+  it('orders a listing through the whole stack', async () => {
+    for (const key of ['charlie', 'alpha', 'bravo']) {
+      await service.createTemplate(createInput(key));
+    }
+
+    const page = await service.getPaginatedTemplates(1, 10, true, {
+      field: 'key',
+      direction: 'desc',
+    });
+
+    expect(page.map((template) => template.key)).toEqual(['charlie', 'bravo', 'alpha']);
+  });
+
+  it('refuses an order the backend cannot apply', async () => {
+    await expect(
+      service.getPaginatedTemplates(1, 10, true, { field: 'status', direction: 'asc' }),
+    ).rejects.toThrow(/orderBy\.status/);
+  });
+
+  it('pages without repeating or dropping a row', async () => {
+    for (const key of ['charlie', 'alpha', 'bravo', 'delta']) {
+      await service.createTemplate(createInput(key));
+    }
+    const order = { field: 'key', direction: 'asc' } as const;
+
+    const first = await service.getPaginatedTemplates(1, 2, true, order);
+    const second = await service.getPaginatedTemplates(2, 2, true, order);
+
+    expect([...first, ...second].map((t) => t.key)).toEqual(['alpha', 'bravo', 'charlie', 'delta']);
   });
 });
