@@ -142,12 +142,58 @@ service.getBackendSupportedFilterCapabilities();
 |---|---|
 | `logical.or`, `logical.not`, `logical.notNested` | FHIR search ANDs its parameters; there is no disjunction and no negation |
 | `fields.version` | `MessageDefinition.version` is a FHIR *string*, so there is no numeric comparison |
-| `fields.mostRecentActiveVersion` | It compares a row against its key's other versions. FHIR has no group-by |
 | `stringLookups.endsWith` | FHIR offers starts-with, contains and exact. There is no ends-with |
 
 Everything else is answered by the server: `key` and `templateManagedBackend` as identifier
 tokens, `name` and `description` as FHIR string searches, `status` and `isAbstract` as tokens,
 tags through `_tag`, and both date ranges through `date` and `_lastUpdated`.
+
+### `mostRecentActiveVersion`, without a group-by
+
+"The highest-numbered active-or-draft version of each key" is a comparison against a key's *other*
+rows, and FHIR has no group-by. It is answered anyway, by **denormalization**: each row carries a
+`current-version` identifier saying whether it is the one, so the filter is an ordinary token
+match — `true` and `false` both, since the flag is stored on every row rather than only the winner.
+
+This is the same trade the seam already asks every backend to make for `isAbstract`: compute at
+write time what a read cannot express.
+
+The cost is on the write side. Four writes can move the answer, and each recomputes the key
+afterwards:
+
+| Write | How the answer moves |
+|---|---|
+| `createTemplate` | a new key's only version becomes current |
+| `updateTemplate` | the inserted draft supersedes the version it was copied from |
+| `deleteTemplate` | deleting the current version promotes the next one down |
+| status change | retiring the current version promotes another; the flag can move *down* |
+
+The winner is decided by the library's own `isMostRecentActiveVersion`, not by a rule re-derived
+here, so the stored flag cannot come to mean something different from the filter. One test asserts
+the two agree over a whole store.
+
+**A recompute is one search and at most two writes**, and the writes go in a single FHIR
+transaction bundle, so a listing never shows a key twice. New rows are written *unflagged* and
+promoted afterwards for the same reason: a new version that arrived already current would double
+its key. What remains is a window between the write that moved the answer and the recompute, during
+which the listing shows the **previous** current version — stale by one write, never doubled and
+never empty.
+
+Two concurrent updates can still both insert version `n + 1`; that is the pre-existing
+read-then-insert race, and the flag inherits it rather than adding to it.
+
+### Upgrading an existing store
+
+A row written before this flag existed does not carry it, and an absent flag reads as *not
+current* — so `mostRecentActiveVersion: true` returns nothing for those keys until something
+writes to them. Run the backfill once after upgrading:
+
+```ts
+await backend.backfillCurrentVersions(); // → how many keys it looked at
+```
+
+It is idempotent: a key already correct costs a read and no write, so re-running it is safe and a
+partial run can just be repeated.
 
 **Dropping widens.** A listing that could not collapse to one row per key comes back with every
 version instead — visible in the result, unlike an order that was quietly ignored. Read the

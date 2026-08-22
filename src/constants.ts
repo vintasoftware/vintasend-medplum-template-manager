@@ -29,6 +29,12 @@ export const IDENTIFIER_SYSTEM = {
   status: 'http://vintasend.com/fhir/managed-template-status',
   backend: 'http://vintasend.com/fhir/managed-template-backend',
   abstract: 'http://vintasend.com/fhir/managed-template-abstract',
+  /**
+   * Whether this row is its key's most recent active version — denormalized so the filter is a
+   * token match instead of a group-by FHIR does not have. Maintained on every write that can
+   * change the answer; see `refreshCurrentVersion`.
+   */
+  currentVersion: 'http://vintasend.com/fhir/managed-template-current-version',
   tenant: 'http://vintasend.com/fhir/managed-template-tenant',
   tagSlug: 'http://vintasend.com/fhir/managed-template-tag-slug',
 } as const;

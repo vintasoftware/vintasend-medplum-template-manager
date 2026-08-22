@@ -27,10 +27,14 @@
  * indexed query from a full read, or to choose differently.
  *
  * What FHIR search cannot express is now declared instead: no general OR, no general negation, no
- * numeric comparison on a version it stores as a string, no ends-with, and no
- * `mostRecentActiveVersion`, which compares a row against its key's other versions. Callers drop
- * those filters — `ManagedTemplateService` does it for them — and a listing that could not be
- * collapsed to one row per key comes back with every version, which is visible in the result.
+ * numeric comparison on a version it stores as a string, and no ends-with. Callers drop those
+ * filters — `ManagedTemplateService` does it for them.
+ *
+ * `mostRecentActiveVersion` is the exception, and the reason is worth knowing: it compares a row
+ * against its key's other versions, which no query language here expresses, so the answer is
+ * **denormalized onto each row at write time** and the filter becomes a token match. That is the
+ * same trade the seam already asks every backend to make for `isAbstract`. See
+ * `refreshCurrentVersion` for what maintaining it costs.
  *
  * `maxScan` still bounds the reads that are genuinely unbounded: `getAllTemplates`, the tag list,
  * and a version's status history. Paginated reads are no longer among them.
@@ -41,6 +45,7 @@ import type { Basic, MessageDefinition, Provenance } from '@medplum/fhirtypes';
 import type { BaseLogger } from 'vintasend';
 import {
   type BaseTemplateManagerBackend,
+  isMostRecentActiveVersion,
   MANAGED_TEMPLATE_ORDER_BY_FIELDS,
   type ManagedTemplate,
   type ManagedTemplateCreateInput,
@@ -73,11 +78,13 @@ import {
   buildTagResource,
   buildTemplateResource,
   deriveIsAbstract,
+  readCurrentVersionFlag,
   readTemplateTagSlugs,
   statusChangeTargetId,
   toManagedTag,
   toManagedTemplate,
   toStatusHistory,
+  withCurrentVersionFlag,
   withTagStatus,
   withTagText,
   withTemplateStatus,
@@ -154,8 +161,6 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
       'logical.notNested': false,
       // `MessageDefinition.version` is a FHIR string, so there is no numeric comparison for it.
       'fields.version': false,
-      // Answered by comparing a row against its key's other versions, which is not a parameter.
-      'fields.mostRecentActiveVersion': false,
       // FHIR string search offers starts-with, contains and exact. There is no ends-with.
       'stringLookups.endsWith': false,
       ...Object.fromEntries(
@@ -192,6 +197,7 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
         this.urlPrefix,
       ),
     );
+    await this.refreshCurrentVersion(data.key);
     return toManagedTemplate(created, indexBySlug(tags));
   }
 
@@ -247,6 +253,7 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
         this.urlPrefix,
       ),
     );
+    await this.refreshCurrentVersion(previous.key);
     return toManagedTemplate(created, indexBySlug(tags));
   }
 
@@ -264,6 +271,7 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
     const resourceId = resource.id as string;
 
     await this.medplum.deleteResource('MessageDefinition', resourceId);
+    await this.refreshCurrentVersion(templateKey);
 
     try {
       for (const provenance of await this.searchStatusChanges([resourceId])) {
@@ -294,6 +302,7 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
         recordedAt: new Date(),
       }),
     );
+    await this.refreshCurrentVersion(params.templateKey);
   }
 
   async getTemplateStatusHistory(
@@ -498,6 +507,101 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
   // -------------------------------------------------------------------------------------------
   // Internals
   // -------------------------------------------------------------------------------------------
+
+  /**
+   * Stamp the current-version flag across a store written before it existed.
+   *
+   * The flag is maintained from here on by every write that can move it, but a template already
+   * in the store has no flag at all — and an absent flag reads as *not current*, so
+   * `mostRecentActiveVersion: true` would return nothing for those keys until each one happened
+   * to be written again. Run this once after upgrading.
+   *
+   * Idempotent: a key whose flag is already right costs a read and no write, so re-running it is
+   * safe and a partial run can simply be repeated.
+   *
+   * @returns how many keys it looked at.
+   */
+  async backfillCurrentVersions(): Promise<number> {
+    const resources = await this.searchTemplateResources([templateKindTuple()]);
+    const noTags = new Map<string, ManagedTemplateTag>();
+    const keys = new Set(
+      resources.map((resource) => toManagedTemplate(resource, noTags).key).filter(Boolean),
+    );
+
+    for (const key of keys) {
+      await this.refreshCurrentVersion(key);
+    }
+    return keys.size;
+  }
+
+  /**
+   * Recompute which version of `templateKey` is current, and write the flag where it moved.
+   *
+   * This is the write-side cost of denormalizing `mostRecentActiveVersion`. FHIR has no group-by,
+   * so the filter cannot be a query over a key's other versions — but it can be a token match
+   * against an answer computed here, which is the same trade `isAbstract` already makes.
+   *
+   * Four writes can change the answer, and each one calls this afterwards:
+   *
+   * | Write | How the answer moves |
+   * |---|---|
+   * | `createTemplate` | a new key's only version becomes current |
+   * | `updateTemplate` | the inserted draft supersedes the version it was copied from |
+   * | `deleteTemplate` | deleting the current version promotes the next one down |
+   * | `createTemplateStatusUpdate` | retiring the current version promotes another; reactivating an older one may take it back |
+   *
+   * The winner is decided by the library's own `isMostRecentActiveVersion` rather than by a rule
+   * re-derived here, so the stored flag cannot drift from what the filter means.
+   *
+   * **The flips go in one transaction bundle**, so a listing never shows a key twice. The window
+   * that remains is between the write that moved the answer and this call: during it the flag is
+   * one write stale, which shows the *previous* current version rather than none or two. New
+   * resources are built with the flag `false` for exactly that reason — a new version that
+   * arrived already flagged would double the key instead.
+   */
+  private async refreshCurrentVersion(templateKey: string): Promise<void> {
+    const resources = await this.searchTemplateResources([
+      templateKindTuple(),
+      ['identifier', `${IDENTIFIER_SYSTEM.key}|${escapeSearchValue(templateKey)}`],
+    ]);
+    if (resources.length === 0) {
+      return;
+    }
+
+    // Mapped without hydrating tags: the answer turns on key, version and status alone, and a
+    // tag lookup on every write would be paid for nothing.
+    const noTags = new Map<string, ManagedTemplateTag>();
+    const templates = resources.map((resource) => toManagedTemplate(resource, noTags));
+    const byId = new Map(templates.map((template) => [String(template.id), template]));
+
+    const moved = resources.filter((resource) => {
+      const template = byId.get(String(resource.id));
+      if (template === undefined) {
+        return false;
+      }
+      const shouldBeCurrent = isMostRecentActiveVersion(template, templates);
+      return readCurrentVersionFlag(resource) !== shouldBeCurrent;
+    });
+
+    if (moved.length === 0) {
+      return;
+    }
+
+    await this.medplum.executeBatch({
+      resourceType: 'Bundle',
+      type: 'transaction',
+      entry: moved.map((resource) => {
+        const template = byId.get(String(resource.id)) as ManagedTemplate;
+        return {
+          request: { method: 'PUT' as const, url: `MessageDefinition/${resource.id}` },
+          resource: withCurrentVersionFlag(
+            resource,
+            isMostRecentActiveVersion(template, templates),
+          ),
+        };
+      }),
+    });
+  }
 
   /** Attach the tag records behind each resource's `meta.tag`, in one read for the whole set. */
   private async hydrate(resources: MessageDefinition[]): Promise<ManagedTemplate[]> {

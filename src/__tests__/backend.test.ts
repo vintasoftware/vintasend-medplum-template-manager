@@ -8,14 +8,18 @@
 
 import { MockClient } from '@medplum/mock';
 import {
+  isMostRecentActiveVersion,
   type ManagedTemplateCreateInput,
   ManagedTemplateInvalidFilterError,
   ManagedTemplateNotFoundError,
+  type ManagedTemplateStatus,
   ManagedTemplateTagAlreadyExistsError,
   ManagedTemplateTagNotFoundError,
 } from 'vintasend-managed-templates';
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { DEFAULT_URL_PREFIX, IDENTIFIER_SYSTEM } from '../constants.js';
+import { buildTemplateResource } from '../mapping.js';
 import { MedplumTemplateManagerBackend } from '../medplum-template-manager-backend.js';
 
 function createInput(
@@ -444,11 +448,104 @@ describe('filtering', () => {
     expect(await backend.getFilteredTemplates({ isAbstract: false })).toHaveLength(2);
   });
 
-  it('refuses mostRecentActiveVersion, which is a comparison rather than a parameter', async () => {
-    // Answering it means finding, per key, the highest-numbered active-or-draft version. FHIR has
-    // no group-by, so this was the single biggest thing the in-memory pass was doing.
-    await expect(backend.getFilteredTemplates({ mostRecentActiveVersion: true })).rejects.toThrow(
-      /mostRecentActiveVersion/,
+  it('keeps only the current version of each key for mostRecentActiveVersion', async () => {
+    // FHIR has no group-by, so this is answered from a flag maintained on every write rather than
+    // from a query over the key's other versions.
+    await backend.updateTemplate('welcome', {});
+    await backend.updateTemplate('welcome', {});
+
+    const current = await backend.getFilteredTemplates({ mostRecentActiveVersion: true });
+
+    expect(current.filter((template) => template.key === 'welcome')).toHaveLength(1);
+    expect(current.find((template) => template.key === 'welcome')?.version).toBe(3);
+  });
+
+  it('drops a key whose versions are all retired', async () => {
+    await backend.createTemplateStatusUpdate({
+      templateKey: 'welcome',
+      version: 1,
+      status: 'active',
+    });
+    await backend.createTemplateStatusUpdate({
+      templateKey: 'welcome',
+      version: 1,
+      status: 'archived',
+    });
+
+    const current = await backend.getFilteredTemplates({ mostRecentActiveVersion: true });
+
+    expect(current.some((template) => template.key === 'welcome')).toBe(false);
+  });
+
+  it('treats mostRecentActiveVersion false as the exact complement', async () => {
+    await backend.updateTemplate('welcome', {});
+
+    const older = await backend.getFilteredTemplates({ mostRecentActiveVersion: false });
+
+    expect(older.map((template) => `${template.key}@${template.version}`)).toEqual(['welcome@1']);
+  });
+
+  it('promotes the next version down when the current one is deleted', async () => {
+    // Deleting a row changes the answer for its key, which is why the delete path refreshes too.
+    await backend.updateTemplate('welcome', {});
+    await backend.deleteTemplate('welcome', 2);
+
+    const current = await backend.getFilteredTemplates({ mostRecentActiveVersion: true });
+
+    expect(current.find((template) => template.key === 'welcome')?.version).toBe(1);
+  });
+
+  it('takes the flag back when an older version is reactivated above a retired one', async () => {
+    // The subtle direction: retiring the newest version has to hand "current" back down.
+    await backend.updateTemplate('welcome', {});
+    await backend.createTemplateStatusUpdate({
+      templateKey: 'welcome',
+      version: 2,
+      status: 'active',
+    });
+    await backend.createTemplateStatusUpdate({
+      templateKey: 'welcome',
+      version: 2,
+      status: 'archived',
+    });
+
+    const current = await backend.getFilteredTemplates({ mostRecentActiveVersion: true });
+
+    expect(current.find((template) => template.key === 'welcome')?.version).toBe(1);
+  });
+
+  it('never flags two versions of a key at once', async () => {
+    // A doubled flag shows the key twice in a listing, which is why new resources are written
+    // unflagged and promoted afterwards rather than arriving already current.
+    await backend.updateTemplate('welcome', {});
+    await backend.updateTemplate('welcome', {});
+    await backend.createTemplateStatusUpdate({
+      templateKey: 'welcome',
+      version: 3,
+      status: 'active',
+    });
+
+    const current = await backend.getFilteredTemplates({ mostRecentActiveVersion: true });
+
+    expect(current.filter((template) => template.key === 'welcome')).toHaveLength(1);
+  });
+
+  it('agrees with the library evaluator it denormalizes', async () => {
+    // The flag has to mean exactly what the filter means, so the winner is decided by the
+    // library's own predicate rather than by a rule re-derived in this backend.
+    await backend.updateTemplate('welcome', {});
+    await backend.createTemplateStatusUpdate({
+      templateKey: 'welcome',
+      version: 1,
+      status: 'active',
+    });
+
+    const all = await backend.getAllTemplates();
+    const flagged = await backend.getFilteredTemplates({ mostRecentActiveVersion: true });
+    const expected = all.filter((template) => isMostRecentActiveVersion(template, all));
+
+    expect(flagged.map((t) => `${t.key}@${t.version}`).sort()).toEqual(
+      expected.map((t) => `${t.key}@${t.version}`).sort(),
     );
   });
 
@@ -501,9 +598,14 @@ describe('capabilities', () => {
       'logical.not': false,
       'logical.notNested': false,
       'fields.version': false,
-      'fields.mostRecentActiveVersion': false,
       'stringLookups.endsWith': false,
     });
+  });
+
+  it('does not declare mostRecentActiveVersion unsupported', () => {
+    // Absent from the report means supported, and here that is earned: the read is a token match
+    // against a flag maintained on write, not an emulation over a scan.
+    expect(backend.getFilterCapabilities()).not.toHaveProperty('fields.mostRecentActiveVersion');
   });
 
   it('declares the four orders it can genuinely serve', () => {
@@ -553,5 +655,78 @@ describe('scan limit', () => {
     }
 
     expect(await bounded.getAllTemplates()).toHaveLength(3);
+  });
+});
+
+describe('backfilling the current-version flag', () => {
+  /**
+   * A row exactly as the previous version of this backend wrote it.
+   *
+   * Built with the real builder and then stripped of the current-version identifier, rather than
+   * hand-assembled — a hand-written fixture that drifts from `buildTemplateResource` would stop
+   * representing legacy data and start representing nothing.
+   */
+  async function withoutFlag(key: string, version: number, status: ManagedTemplateStatus) {
+    const resource = buildTemplateResource(
+      {
+        key,
+        version,
+        name: key,
+        description: '',
+        templateManagedBackend: 'medplum',
+        bodyTemplate: '<p>hi</p>',
+        subjectTemplate: 'Hi',
+        preheaderTemplate: null,
+        status,
+        tenant: null,
+        createdAt: new Date(2026, 0, version),
+        tags: [],
+      },
+      DEFAULT_URL_PREFIX,
+    );
+
+    return medplum.createResource({
+      ...resource,
+      identifier: (resource.identifier ?? []).filter(
+        (entry) => entry.system !== IDENTIFIER_SYSTEM.currentVersion,
+      ),
+    });
+  }
+
+  it('finds nothing current in a store written before the flag existed', async () => {
+    // The migration hazard: an absent flag reads as "not current", so the whole key disappears
+    // from the default listing until something writes to it.
+    await withoutFlag('legacy', 1, 'active');
+    await withoutFlag('legacy', 2, 'active');
+
+    expect(await backend.getFilteredTemplates({ mostRecentActiveVersion: true })).toHaveLength(0);
+  });
+
+  it('stamps the right version once backfilled', async () => {
+    await withoutFlag('legacy', 1, 'active');
+    await withoutFlag('legacy', 2, 'active');
+
+    const keys = await backend.backfillCurrentVersions();
+    const current = await backend.getFilteredTemplates({ mostRecentActiveVersion: true });
+
+    expect(keys).toBe(1);
+    expect(current.map((t) => `${t.key}@${t.version}`)).toEqual(['legacy@2']);
+  });
+
+  it('leaves a key with nothing active unflagged', async () => {
+    await withoutFlag('retired', 1, 'archived');
+
+    await backend.backfillCurrentVersions();
+
+    expect(await backend.getFilteredTemplates({ mostRecentActiveVersion: true })).toHaveLength(0);
+  });
+
+  it('is idempotent', async () => {
+    await withoutFlag('legacy', 1, 'active');
+
+    await backend.backfillCurrentVersions();
+    await backend.backfillCurrentVersions();
+
+    expect(await backend.getFilteredTemplates({ mostRecentActiveVersion: true })).toHaveLength(1);
   });
 });

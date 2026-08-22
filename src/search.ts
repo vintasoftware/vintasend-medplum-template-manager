@@ -15,6 +15,12 @@
  * FHIR search is an AND of parameters: repeating a parameter ANDs, comma-separating its values
  * ORs *within* that parameter. There is no general OR and no general negation, which is why
  * `logical.or` and `logical.not` are declared unsupported.
+ *
+ * Two filters that would otherwise need more than a parameter are answered by **denormalization**:
+ * the answer is computed at write time and stored on the row, so the read is a token match.
+ * `isAbstract` is derived from the template source, and `mostRecentActiveVersion` from the key's
+ * other versions. The seam already asks every backend to do the first; the second follows the
+ * same pattern.
  */
 
 import {
@@ -264,11 +270,13 @@ function fieldTuples(fields: ManagedTemplateFilterFields): SearchTuples {
     );
   }
 
+  // A comparison against a key's other versions, answered as a token because the answer is
+  // denormalized onto each row at write time. See `refreshCurrentVersion`.
   if (fields.mostRecentActiveVersion !== undefined) {
-    throw new ManagedTemplateInvalidFilterError(
-      'This backend cannot answer mostRecentActiveVersion (the capability is false). It ' +
-        "compares a row against its key's other versions, which is not a search parameter.",
-    );
+    tuples.push([
+      'identifier',
+      token(IDENTIFIER_SYSTEM.currentVersion, String(fields.mostRecentActiveVersion)),
+    ]);
   }
 
   // Repeating `_tag` is AND, which is what "carries every one of these" means.

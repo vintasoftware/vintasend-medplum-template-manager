@@ -126,6 +126,10 @@ export function buildTemplateResource(
       identifier(IDENTIFIER_SYSTEM.status, input.status),
       identifier(IDENTIFIER_SYSTEM.backend, input.templateManagedBackend),
       identifier(IDENTIFIER_SYSTEM.abstract, String(abstract)),
+      // Always false on a fresh resource. `refreshCurrentVersion` promotes the right row once the
+      // write has landed, so a new version never briefly shares "current" with the one it
+      // supersedes — during that window the listing is one version stale rather than doubled.
+      identifier(IDENTIFIER_SYSTEM.currentVersion, 'false'),
       ...(input.tenant === null ? [] : [identifier(IDENTIFIER_SYSTEM.tenant, input.tenant)]),
     ],
     meta: {
@@ -248,6 +252,33 @@ export function withTemplateTags(
 }
 
 /** Move a resource to a managed status, keeping the FHIR summary field in step. */
+/**
+ * The resource with its current-version flag set, or the same object when it already agrees.
+ *
+ * Returning the input unchanged is what lets `refreshCurrentVersion` write only the rows that
+ * actually move.
+ */
+export function withCurrentVersionFlag(
+  resource: MessageDefinition,
+  isCurrent: boolean,
+): MessageDefinition {
+  if (readCurrentVersionFlag(resource) === isCurrent) {
+    return resource;
+  }
+  const identifiers = (resource.identifier ?? []).filter(
+    (entry) => entry.system !== IDENTIFIER_SYSTEM.currentVersion,
+  );
+  return {
+    ...resource,
+    identifier: [...identifiers, identifier(IDENTIFIER_SYSTEM.currentVersion, String(isCurrent))],
+  };
+}
+
+/** A resource written before this flag existed reads as not current, which a refresh corrects. */
+export function readCurrentVersionFlag(resource: MessageDefinition): boolean {
+  return readIdentifier(resource.identifier, IDENTIFIER_SYSTEM.currentVersion) === 'true';
+}
+
 export function withTemplateStatus(
   resource: MessageDefinition,
   status: ManagedTemplateStatus,

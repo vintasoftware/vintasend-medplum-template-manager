@@ -151,11 +151,7 @@ describe('the whole stack over Medplum', () => {
     expect(result.rendered.body).toBe('v1');
   });
 
-  it('lists every version, because this backend cannot collapse them', async () => {
-    // The service's default listing asks for one row per key. Medplum declares
-    // `fields.mostRecentActiveVersion: false`, so the service drops the filter and the read
-    // widens rather than failing — the extra rows are the visible consequence, and the
-    // capability report is where a caller finds out why.
+  it('lists one row per key by default, hiding a key old versions', async () => {
     await service.createTemplate(createInput('welcome'));
     await service.updateTemplate('welcome', {});
     await service.createTemplate(createInput('receipt'));
@@ -164,7 +160,6 @@ describe('the whole stack over Medplum', () => {
 
     expect(listed.map((template) => `${template.key}@${template.version}`).sort()).toEqual([
       'receipt@1',
-      'welcome@1',
       'welcome@2',
     ]);
   });
@@ -192,7 +187,8 @@ describe('the whole stack over Medplum', () => {
     const capabilities = service.getBackendSupportedFilterCapabilities();
 
     expect(capabilities['logical.or']).toBe(false);
-    expect(capabilities['fields.mostRecentActiveVersion']).toBe(false);
+    // Denormalized onto each row at write time, so the default listing still collapses.
+    expect(capabilities['fields.mostRecentActiveVersion']).toBe(true);
     expect(capabilities['stringLookups.endsWith']).toBe(false);
     // Merged over the library default, so what the backend does not mention stays supported.
     expect(capabilities['fields.key']).toBe(true);
