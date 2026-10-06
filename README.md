@@ -62,6 +62,7 @@ new MedplumTemplateManagerBackend(medplum, {
   urlPrefix: 'https://acme.example/fhir/templates/', // default: urn:vintasend:managed-template:
   maxScan: 5000, // resources one read will pull back before throwing
   pageSize: 1000, // resources per search request; Medplum caps this at 1000
+  allowDeletingPublishedVersions: false, // the default; see "Deleting a version"
 });
 ```
 
@@ -114,6 +115,27 @@ FHIR's publication status has four values and only one of them is "retired", so 
 sees. A resource written by something other than this package has no identifier, so its FHIR
 status is read as a best effort — and `retired` resolves to `inactive`, the reversible of the two,
 because guessing wrong toward a terminal status would take a template's future away.
+
+### Which version a send renders
+
+`getActiveTemplate(key)` answers the send path: the highest-numbered version whose managed status
+is `active`, compared as a number rather than as the string FHIR stores. Drafts are never sent. A
+key with versions but no active one throws `ManagedTemplateNoActiveVersionError`, which
+`vintasend-managed-templates` treats as "nothing published yet" — so a renderer's registered
+fallback applies. `getTemplate(key)` with no version still returns the newest version of any
+status, for editors and the API.
+
+### Deleting a version
+
+`deleteTemplate` deletes only a version that was never published: still `draft`, with no
+`Provenance` other than `draft` targeting it. Anything else throws
+`ManagedTemplateDeletionNotAllowedError` — archive it instead. That includes a call with no
+`version`, which resolves to the latest version and is refused when that version is published.
+
+The `Provenance` resources are **never** deleted. They are the record of who published what, and a
+notification pinned to a version is only explainable through them. `allowDeletingPublishedVersions:
+true` lifts the status check for an operator who really needs a hard delete — the deletion is then
+logged with the resource id — but the `Provenance` trail stays in the store either way.
 
 ### Tags
 
@@ -255,12 +277,10 @@ is a duplicate version number rather than a lost write: both resources exist, bo
 and the later one wins every "latest" resolution. Put the writes behind your own lock if that
 matters — the seam has no way to ask FHIR for one.
 
-**No cascade.** Deleting a version deletes its `MessageDefinition` first and then its
-`Provenance` records, in that order on purpose: a failure partway through leaves the thing the
-caller asked about gone rather than leaving it in place with a trail that no longer records how it
-got there. Orphaned `Provenance` resources are unreachable through this backend — history is
-looked up through a live version — so a failed cleanup is untidy rather than wrong, and it is
-logged through the injected logger.
+**No cascade, on purpose.** Deleting a version deletes its `MessageDefinition` only. Its
+`Provenance` records stay in the project as audit records; this backend looks history up through a
+live version, so the trail of a deleted version is no longer listed by `getTemplateStatusHistory`,
+but any FHIR client can still read it by `target`.
 
 ## Development
 

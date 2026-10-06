@@ -10,6 +10,7 @@ import { MockClient } from '@medplum/mock';
 import {
   isMostRecentActiveVersion,
   type ManagedTemplateCreateInput,
+  ManagedTemplateDeletionNotAllowedError,
   ManagedTemplateInvalidFilterError,
   ManagedTemplateNotFoundError,
   ManagedTemplateTagAlreadyExistsError,
@@ -231,7 +232,7 @@ describe('status history', () => {
     );
   });
 
-  it('clears a version audit trail when the version is deleted', async () => {
+  it('keeps a version audit trail rather than deleting the published version', async () => {
     await backend.createTemplate(createInput('welcome'));
     await backend.createTemplateStatusUpdate({
       templateKey: 'welcome',
@@ -239,9 +240,11 @@ describe('status history', () => {
       status: 'active',
     });
 
-    await backend.deleteTemplate('welcome', 1);
+    await expect(backend.deleteTemplate('welcome', 1)).rejects.toThrow(
+      ManagedTemplateDeletionNotAllowedError,
+    );
 
-    expect(await medplum.searchResources('Provenance', {})).toHaveLength(0);
+    expect(await medplum.searchResources('Provenance', {})).toHaveLength(1);
   });
 });
 
