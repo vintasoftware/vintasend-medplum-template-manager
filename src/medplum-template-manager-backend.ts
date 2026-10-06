@@ -49,6 +49,7 @@ import type { MedplumClient } from '@medplum/core';
 import type { Basic, MessageDefinition, Provenance } from '@medplum/fhirtypes';
 import type { BaseLogger } from 'vintasend';
 import {
+  assertTemplateVersionDeletable,
   type BaseTemplateManagerBackend,
   isMostRecentActiveVersion,
   MANAGED_TEMPLATE_ORDER_BY_FIELDS,
@@ -66,7 +67,9 @@ import {
   ManagedTemplateTagNotFoundError,
   type ManagedTemplateTagStatus,
   type ManagedTemplateUpdateInput,
+  newestActiveVersion,
   nextAvailableSlug,
+  noActiveVersion,
   normalizeTagText,
   orderByCapabilityKey,
   slugifyTag,
@@ -120,6 +123,16 @@ export type MedplumTemplateManagerBackendOptions = {
    * default; lower it only for a server that struggles with pages that size.
    */
   pageSize?: number;
+  /**
+   * When true, `deleteTemplate` removes a version whatever its status. Off by default: only a
+   * version that was never published — still `draft`, with nothing but `draft` in its status
+   * history — can be deleted, and anything else throws `ManagedTemplateDeletionNotAllowedError`.
+   * Retire a published version with `archive` instead. `ManagedTemplateService` checks the same
+   * rule under its own option of this name, so a hard delete through the service needs both.
+   *
+   * The version's `Provenance` trail is kept either way.
+   */
+  allowDeletingPublishedVersions?: boolean;
 };
 
 export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend {
@@ -131,6 +144,8 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
 
   private readonly pageSize: number;
 
+  private readonly allowDeletingPublishedVersions: boolean;
+
   constructor(
     private readonly medplum: MedplumClient,
     options: MedplumTemplateManagerBackendOptions = {},
@@ -138,6 +153,7 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
     this.urlPrefix = options.urlPrefix ?? DEFAULT_URL_PREFIX;
     this.maxScan = options.maxScan ?? DEFAULT_MAX_SCAN;
     this.pageSize = options.pageSize ?? SEARCH_PAGE_SIZE;
+    this.allowDeletingPublishedVersions = options.allowDeletingPublishedVersions ?? false;
   }
 
   injectLogger(logger: BaseLogger): void {
@@ -211,6 +227,35 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
   }
 
   /**
+   * The newest `active` version — what an unpinned send renders.
+   *
+   * One search for the key's versions, compared by version number rather than by the string FHIR
+   * stores it as, and tags hydrated only for the winner.
+   */
+  async getActiveTemplate(templateKey: string): Promise<ManagedTemplate> {
+    const resources = await this.searchTemplateResources([
+      templateKindTuple(),
+      ['identifier', `${IDENTIFIER_SYSTEM.key}|${escapeSearchValue(templateKey)}`],
+    ]);
+    if (resources.length === 0) {
+      throw new ManagedTemplateNotFoundError(describeMissing(templateKey, null));
+    }
+
+    const noTags = new Map<string, ManagedTemplateTag>();
+    const active = newestActiveVersion(
+      resources.map((resource) => toManagedTemplate(resource, noTags)),
+    );
+    const resource =
+      active === undefined
+        ? undefined
+        : resources.find((candidate) => String(candidate.id) === String(active.id));
+    if (resource === undefined) {
+      throw noActiveVersion(templateKey);
+    }
+    return (await this.hydrate([resource]))[0] as ManagedTemplate;
+  }
+
+  /**
    * Insert the next version of a key, leaving the version it was copied from alone.
    *
    * A new resource, never an edit. A version that is already active keeps its content, its status
@@ -262,31 +307,33 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
   }
 
   /**
-   * Delete one version, then its audit trail.
+   * Delete one version that was never published. Its `Provenance` trail is never deleted.
    *
-   * That order on purpose: the caller asked for the version to go, and a failure partway through
-   * should leave the thing they asked about gone rather than leave it in place with a trail that
-   * no longer records how it got there. Orphaned `Provenance` resources are unreachable through
-   * this backend — history is looked up through a live version — so a failed cleanup is untidy
-   * rather than wrong, and it is logged.
+   * A version that was ever published is refused with `ManagedTemplateDeletionNotAllowedError`
+   * unless `allowDeletingPublishedVersions` is on: a notification may be pinned to it, and its
+   * `Provenance` resources are the record of who published it. Those stay in the store even when a
+   * hard delete is allowed — they are FHIR's audit records and have to outlive what they describe.
    */
   async deleteTemplate(templateKey: string, version: number | null = null): Promise<void> {
     const resource = await this.requireResource(templateKey, version);
     const resourceId = resource.id as string;
 
-    await this.medplum.deleteResource('MessageDefinition', resourceId);
-    await this.refreshCurrentVersion(templateKey);
-
-    try {
-      for (const provenance of await this.searchStatusChanges([resourceId])) {
-        await this.medplum.deleteResource('Provenance', provenance.id as string);
-      }
-    } catch (error) {
-      this.logger?.warn?.(
-        `[MedplumTemplateManager] deleted MessageDefinition/${resourceId} but could not clear ` +
-          `its status history: ${describeError(error)}`,
+    if (!this.allowDeletingPublishedVersions) {
+      const template = (await this.hydrate([resource]))[0] as ManagedTemplate;
+      const history = (await this.searchStatusChanges([resourceId])).map((change) =>
+        toStatusHistory(change, template),
+      );
+      assertTemplateVersionDeletable(template, history);
+    } else {
+      // Opaque identifiers only: the operator switched the rule off, so say which resource went.
+      this.logger?.warn(
+        `[MedplumTemplateManager] deleting MessageDefinition/${resourceId} without checking ` +
+          'whether it was published (allowDeletingPublishedVersions is on).',
       );
     }
+
+    await this.medplum.deleteResource('MessageDefinition', resourceId);
+    await this.refreshCurrentVersion(templateKey);
   }
 
   async createTemplateStatusUpdate(params: {
@@ -761,10 +808,6 @@ function describeMissing(templateKey: string, version: number | null): string {
     return `No template with key '${templateKey}' was found.`;
   }
   return `Template '${templateKey}' has no version ${version}.`;
-}
-
-function describeError(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 export { deriveIsAbstract };

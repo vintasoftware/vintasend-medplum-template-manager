@@ -122,6 +122,7 @@ describe('the whole stack over Medplum', () => {
         subjectTemplate: '{% managed_extends "base-email" %}Welcome aboard',
       }),
     );
+    await service.activate('welcome');
 
     const result = await service.render(notification('welcome'), { name: 'Ana' });
 
