@@ -24,6 +24,7 @@ import {
 } from 'vintasend-managed-templates';
 import { beforeEach, describe, expect, it } from 'vitest';
 
+import { STATUS_CHANGE_TAG_SYSTEM } from '../constants.js';
 import { MedplumTemplateManagerBackend } from '../medplum-template-manager-backend.js';
 
 type TestConfig = {
@@ -238,5 +239,54 @@ describe('deleting', () => {
 
     await expect(permissive.getTemplate('k', 1)).rejects.toThrow(ManagedTemplateNotFoundError);
     expect(await medplum.searchResources('Provenance', {})).toHaveLength(1);
+  });
+});
+
+describe('version numbers after a delete', () => {
+  let permissive: MedplumTemplateManagerBackend;
+
+  beforeEach(() => {
+    permissive = new MedplumTemplateManagerBackend(medplum, {
+      allowDeletingPublishedVersions: true,
+    });
+  });
+
+  async function publishVersion(version: number): Promise<void> {
+    await permissive.createTemplateStatusUpdate({ templateKey: 'k', version, status: 'active' });
+  }
+
+  it('never reuse a published version number', async () => {
+    await permissive.createTemplate(createInput('k'));
+    await publishVersion(1);
+    await permissive.updateTemplate('k', { bodyTemplate: 'p v2' });
+    await publishVersion(2);
+    await permissive.deleteTemplate('k', 2);
+
+    const next = await permissive.updateTemplate('k', { bodyTemplate: 'p v3' });
+
+    expect(next.version).toBe(3);
+    await expect(permissive.getTemplate('k', 2)).rejects.toThrow(ManagedTemplateNotFoundError);
+  });
+
+  it('start a recreated key above every number its history used', async () => {
+    await permissive.createTemplate(createInput('k'));
+    await publishVersion(1);
+    await permissive.deleteTemplate('k', 1);
+
+    expect((await permissive.createTemplate(createInput('k'))).version).toBe(2);
+  });
+
+  it('tag each status change with the key and version it was recorded against', async () => {
+    await permissive.createTemplate(createInput('k'));
+    await publishVersion(1);
+
+    const [provenance] = await medplum.searchResources('Provenance', {});
+
+    expect(provenance?.meta?.tag).toEqual(
+      expect.arrayContaining([
+        { system: STATUS_CHANGE_TAG_SYSTEM.key, code: 'k' },
+        { system: STATUS_CHANGE_TAG_SYSTEM.version, code: '1' },
+      ]),
+    );
   });
 });

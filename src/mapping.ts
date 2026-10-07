@@ -33,6 +33,7 @@ import {
   IDENTIFIER_SYSTEM,
   RESOURCE_KIND,
   RESOURCE_KIND_SYSTEM,
+  STATUS_CHANGE_TAG_SYSTEM,
   TEMPLATE_EVENT_URI,
   TEMPLATE_TAG_SYSTEM,
   VERSION_SORT_WIDTH,
@@ -398,6 +399,8 @@ export function withTagStatus(resource: Basic, status: ManagedTemplateTagStatus)
 
 export function buildStatusChangeResource(input: {
   templateResourceId: string;
+  templateKey: string;
+  version: number;
   status: ManagedTemplateStatus;
   changedBy: string | null;
   recordedAt: Date;
@@ -418,7 +421,14 @@ export function buildStatusChangeResource(input: {
         who: { display: input.changedBy ?? 'unattributed' },
       },
     ],
-    meta: { tag: [{ system: RESOURCE_KIND_SYSTEM, code: RESOURCE_KIND.statusChange }] },
+    meta: {
+      tag: [
+        { system: RESOURCE_KIND_SYSTEM, code: RESOURCE_KIND.statusChange },
+        // Searchable after the target version is deleted, unlike `target` — see `nextVersion`.
+        { system: STATUS_CHANGE_TAG_SYSTEM.key, code: input.templateKey },
+        { system: STATUS_CHANGE_TAG_SYSTEM.version, code: String(input.version) },
+      ],
+    },
     extension: [
       ...stringExtension(EXTENSION_URL.statusChangeStatus, input.status),
       ...stringExtension(EXTENSION_URL.tenant, null),
