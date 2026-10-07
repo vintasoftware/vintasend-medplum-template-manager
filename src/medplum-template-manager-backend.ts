@@ -80,6 +80,7 @@ import {
   DEFAULT_URL_PREFIX,
   IDENTIFIER_SYSTEM,
   SEARCH_PAGE_SIZE,
+  STATUS_CHANGE_TAG_SYSTEM,
 } from './constants.js';
 import {
   buildStatusChangeResource,
@@ -198,11 +199,14 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
 
   async createTemplate(data: ManagedTemplateCreateInput): Promise<ManagedTemplate> {
     const tags = await this.getOrCreateTags(data.tags ?? [], data.tenant);
+    // A key whose versions were all deleted starts above every number its history used.
+    const live = await this.searchKeyResources(data.key);
+    const version = live.length > 0 ? 1 : await this.nextVersion(data.key, live);
     const created = await this.medplum.createResource(
       buildTemplateResource(
         {
           key: data.key,
-          version: 1,
+          version,
           name: data.name,
           description: data.description,
           templateManagedBackend: data.templateManagedBackend,
@@ -286,7 +290,11 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
       buildTemplateResource(
         {
           key: previous.key,
-          version: previous.version + 1,
+          // Not `previous.version + 1`: a deleted version above it keeps its number.
+          version: await this.nextVersion(
+            previous.key,
+            await this.searchKeyResources(previous.key),
+          ),
           name: data.name || previous.name,
           description: data.description ?? previous.description,
           templateManagedBackend: previous.templateManagedBackend,
@@ -348,6 +356,8 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
     await this.medplum.createResource(
       buildStatusChangeResource({
         templateResourceId: resource.id as string,
+        templateKey: params.templateKey,
+        version: params.version,
         status: params.status,
         changedBy: params.changedBy ?? null,
         recordedAt: new Date(),
@@ -732,6 +742,37 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
       templateKindTuple(),
       ['_tag', `http://vintasend.com/fhir/managed-template-tag|${escapeSearchValue(slug)}`],
     ]);
+  }
+
+  private async searchKeyResources(templateKey: string): Promise<MessageDefinition[]> {
+    return this.searchTemplateResources([
+      templateKindTuple(),
+      ['identifier', `${IDENTIFIER_SYSTEM.key}|${escapeSearchValue(templateKey)}`],
+    ]);
+  }
+
+  /**
+   * One above the highest version number the key has ever had: its live versions, and every
+   * version a status change was recorded against, deleted ones included.
+   *
+   * A number is never reused. A notification pinned to a deleted version would otherwise start
+   * rendering whatever took its number, and the deleted version's `Provenance` trail would read as
+   * the newcomer's. A never-published draft that was deleted has no status changes, so its number
+   * can come back — nothing was ever sent from it.
+   */
+  private async nextVersion(templateKey: string, live: MessageDefinition[]): Promise<number> {
+    const recorded = await this.searchAll<Provenance>('Provenance', [
+      ['_tag', `${STATUS_CHANGE_TAG_SYSTEM.key}|${escapeSearchValue(templateKey)}`],
+    ]);
+    const numbers = [
+      ...live.map((resource) => Number.parseInt(resource.version ?? '1', 10)),
+      ...recorded.flatMap((change) =>
+        (change.meta?.tag ?? [])
+          .filter((tag) => tag.system === STATUS_CHANGE_TAG_SYSTEM.version)
+          .map((tag) => Number.parseInt(tag.code ?? '', 10)),
+      ),
+    ].filter(Number.isInteger);
+    return Math.max(0, ...numbers) + 1;
   }
 
   private async searchStatusChanges(templateResourceIds: string[]): Promise<Provenance[]> {

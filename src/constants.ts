@@ -47,6 +47,19 @@ export const IDENTIFIER_SYSTEM = {
  */
 export const TEMPLATE_TAG_SYSTEM = 'http://vintasend.com/fhir/managed-template-tag';
 
+/**
+ * The `meta.tag` systems a status change (`Provenance`) is stamped with: the template key and the
+ * version it was recorded against.
+ *
+ * `Provenance.target` points at a `MessageDefinition` by id, which says nothing once that version
+ * is deleted. These tags keep the key and number searchable, which is what stops a new version
+ * from being handed a deleted one's number — see `nextVersion`.
+ */
+export const STATUS_CHANGE_TAG_SYSTEM = {
+  key: 'http://vintasend.com/fhir/managed-template-status-change-key',
+  version: 'http://vintasend.com/fhir/managed-template-status-change-version',
+} as const;
+
 /** Extension URLs carrying what no FHIR field has a home for. */
 export const EXTENSION_URL = {
   bodyTemplate: 'http://vintasend.com/fhir/StructureDefinition/managed-template-body',
