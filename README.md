@@ -137,6 +137,14 @@ notification pinned to a version is only explainable through them. `allowDeletin
 true` lifts the status check for an operator who really needs a hard delete — the deletion is then
 logged with the resource id — but the `Provenance` trail stays in the store either way.
 
+A deleted version's number is never handed out again. Every `Provenance` is tagged in `meta.tag`
+with the template key and version it was recorded against (`STATUS_CHANGE_TAG_SYSTEM`), since
+`target` points at a resource id that means nothing once the version is gone, and a new version is
+numbered one above the highest of the key's live versions and those tags. Otherwise a notification
+pinned to a deleted version would start rendering whatever took its number. The one number that
+can come back is a never-published draft's: it has no status changes, and nothing was ever sent
+from it. `Provenance` written before this release carries no such tags.
+
 ### Tags
 
 A template's tags live in `meta.tag` as codings. That is what makes tag filtering a server-side
