@@ -7,11 +7,13 @@
  */
 
 import { MockClient } from '@medplum/mock';
-import type {
-  AnyNotification,
-  BaseNotificationTemplateRenderer,
-  ContextGenerator,
-  EmailTemplate,
+import {
+  type AnyNotification,
+  type BaseNotificationTemplateRenderer,
+  type ContextGenerator,
+  type EmailTemplate,
+  type LogMessage,
+  renderLogMessage,
 } from 'vintasend';
 import {
   type ManagedEmailTemplateContent,
@@ -239,6 +241,30 @@ describe('deleting', () => {
 
     await expect(permissive.getTemplate('k', 1)).rejects.toThrow(ManagedTemplateNotFoundError);
     expect(await medplum.searchResources('Provenance', {})).toHaveLength(1);
+  });
+
+  it('logs only the resource reference when deleting without the check, even if the delete fails', async () => {
+    const lines: string[] = [];
+    const record = (message: LogMessage) => lines.push(renderLogMessage(message));
+    const permissive = new MedplumTemplateManagerBackend(medplum, {
+      allowDeletingPublishedVersions: true,
+    });
+    permissive.injectLogger({ info: record, warn: record, error: record });
+    const created = await permissive.createTemplate({
+      ...createInput('k'),
+      bodyTemplate: 'Hello Jane Synthetic, your results are ready',
+      subjectTemplate: 'Results for jane.synthetic@example.com',
+    });
+    medplum.deleteResource = async () => {
+      throw new Error('Cannot delete: Jane Synthetic <jane.synthetic@example.com>');
+    };
+
+    await expect(permissive.deleteTemplate('k', 1)).rejects.toThrow('Jane Synthetic');
+
+    expect(lines).toEqual([expect.stringContaining(`MessageDefinition/${created.id}`)]);
+    const output = lines.join('\n');
+    expect(output).not.toContain('Jane Synthetic');
+    expect(output).not.toContain('jane.synthetic@example.com');
   });
 });
 

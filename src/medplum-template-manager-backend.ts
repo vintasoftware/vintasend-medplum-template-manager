@@ -47,7 +47,7 @@
 
 import type { MedplumClient } from '@medplum/core';
 import type { Basic, MessageDefinition, Provenance } from '@medplum/fhirtypes';
-import type { BaseLogger } from 'vintasend';
+import { type BaseLogger, log, logId } from 'vintasend';
 import {
   assertTemplateVersionDeletable,
   type BaseTemplateManagerBackend,
@@ -335,8 +335,7 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
     } else {
       // Opaque identifiers only: the operator switched the rule off, so say which resource went.
       this.logger?.warn(
-        `[MedplumTemplateManager] deleting MessageDefinition/${resourceId} without checking ` +
-          'whether it was published (allowDeletingPublishedVersions is on).',
+        log`[MedplumTemplateManager] deleting ${logId(`MessageDefinition/${resourceId}`)} without checking whether it was published (allowDeletingPublishedVersions is on).`,
       );
     }
 
