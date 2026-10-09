@@ -1,6 +1,6 @@
 {
   "name": "vintasend-medplum-template-manager",
-  "version": "1.0.0-alpha6",
+  "version": "1.0.0-alpha7",
   "description": "Medplum/FHIR storage for VintaSend managed templates, using MessageDefinition resources.",
   "type": "module",
   "main": "dist/index.js",
@@ -27,8 +27,8 @@
   "peerDependencies": {
     "@medplum/core": "^5.1.1",
     "@medplum/fhirtypes": "^5.1.1",
-    "vintasend": "^1.0.0-alpha6",
-    "vintasend-managed-templates": "1.0.0-alpha6"
+    "vintasend": "^1.0.0-alpha7",
+    "vintasend-managed-templates": "1.0.0-alpha7"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.10",
@@ -39,8 +39,8 @@
     "@types/node": "^25.0.8",
     "@vitest/coverage-v8": "4.0.18",
     "typescript": "^5.9.3",
-    "vintasend": "^1.0.0-alpha6",
-    "vintasend-managed-templates": "^1.0.0-alpha6",
+    "vintasend": "^1.0.0-alpha7",
+    "vintasend-managed-templates": "^1.0.0-alpha7",
     "vitest": "4.0.18"
   },
   "engines": {
