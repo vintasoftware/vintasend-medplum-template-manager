@@ -51,6 +51,7 @@ import { type BaseLogger, log, logId } from 'vintasend';
 import {
   assertTemplateVersionDeletable,
   type BaseTemplateManagerBackend,
+  blankToNull,
   isMostRecentActiveVersion,
   MANAGED_TEMPLATE_ORDER_BY_FIELDS,
   type ManagedTemplate,
@@ -72,6 +73,7 @@ import {
   noActiveVersion,
   normalizeTagText,
   orderByCapabilityKey,
+  resolveUpdatedField,
   slugifyTag,
 } from 'vintasend-managed-templates';
 
@@ -199,9 +201,9 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
 
   async createTemplate(data: ManagedTemplateCreateInput): Promise<ManagedTemplate> {
     const tags = await this.getOrCreateTags(data.tags ?? [], data.tenant);
-    // A key whose versions were all deleted starts above every number its history used.
-    const live = await this.searchKeyResources(data.key);
-    const version = live.length > 0 ? 1 : await this.nextVersion(data.key, live);
+    // 1 for a key never seen; a key whose versions were all deleted starts above every number its
+    // history used. Refusing a key that still has versions is the service's job.
+    const version = await this.nextVersion(data.key, await this.searchKeyResources(data.key));
     const created = await this.medplum.createResource(
       buildTemplateResource(
         {
@@ -211,8 +213,8 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
           description: data.description,
           templateManagedBackend: data.templateManagedBackend,
           bodyTemplate: data.bodyTemplate,
-          subjectTemplate: data.subjectTemplate,
-          preheaderTemplate: data.preheaderTemplate,
+          subjectTemplate: blankToNull(data.subjectTemplate),
+          preheaderTemplate: blankToNull(data.preheaderTemplate),
           status: 'draft',
           tenant: data.tenant,
           createdAt: new Date(),
@@ -299,8 +301,12 @@ export class MedplumTemplateManagerBackend implements BaseTemplateManagerBackend
           description: data.description ?? previous.description,
           templateManagedBackend: previous.templateManagedBackend,
           bodyTemplate: data.bodyTemplate || previous.bodyTemplate,
-          subjectTemplate: data.subjectTemplate ?? previous.subjectTemplate,
-          preheaderTemplate: data.preheaderTemplate ?? previous.preheaderTemplate,
+          // null/undefined carry the latest version's value forward; a blank string clears it.
+          subjectTemplate: resolveUpdatedField(data.subjectTemplate, previous.subjectTemplate),
+          preheaderTemplate: resolveUpdatedField(
+            data.preheaderTemplate,
+            previous.preheaderTemplate,
+          ),
           // A copy nobody has reviewed should not inherit "published".
           status: 'draft',
           tenant: previous.tenant,

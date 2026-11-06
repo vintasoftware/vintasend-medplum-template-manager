@@ -21,6 +21,7 @@ import type {
 } from '@medplum/fhirtypes';
 import {
   isAbstract,
+  isBlank,
   type ManagedTemplate,
   type ManagedTemplateStatus,
   type ManagedTemplateStatusHistory,
@@ -72,8 +73,16 @@ export type TemplateResourceInput = TemplateSources & {
   tags: ManagedTemplateTag[];
 };
 
+/**
+ * An extension for `value`, or none when there is nothing to store.
+ *
+ * FHIR strings cannot be empty or whitespace-only, so a blank value is written as no extension at
+ * all rather than as an invalid `valueString`. Reading an absent extension gives `null`.
+ */
 function stringExtension(url: string, value: string | null | undefined): Extension[] {
-  return value === null || value === undefined ? [] : [{ url, valueString: value }];
+  return value === null || value === undefined || isBlank(value)
+    ? []
+    : [{ url, valueString: value }];
 }
 
 function readStringExtension(extensions: Extension[] | undefined, url: string): string | undefined {
@@ -135,8 +144,9 @@ export function buildTemplateResource(
     version: formatFhirVersion(input.version),
     // Computer-friendly name, which for a managed template is its key.
     name: input.key,
-    title: input.name,
-    description: input.description,
+    // FHIR strings and markdown cannot be blank either; they read back as ''.
+    title: isBlank(input.name) ? undefined : input.name,
+    description: isBlank(input.description) ? undefined : input.description,
     // The backend that manages this template, in the field FHIR keeps for "who publishes this".
     publisher: input.templateManagedBackend,
     status: FHIR_STATUS[input.status],
