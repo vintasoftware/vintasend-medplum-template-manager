@@ -125,6 +125,24 @@ key with versions but no active one throws `ManagedTemplateNoActiveVersionError`
 fallback applies. `getTemplate(key)` with no version still returns the newest version of any
 status, for editors and the API.
 
+The same two reads serve composition. A send composes a base or fragment named without `version=`
+through `getActiveTemplate`, so a draft base never reaches a recipient, and an editor's preview
+(`service.renderStandalone(template, context, { parts: 'latest' })`) composes it through
+`getTemplate`. Publish bases and fragments as well as the templates that use them: a send whose part
+has no active version fails to compose. `service.getCurrentTemplateVersion(key)` is the version new
+notifications are pinned to: the newest active one, or `null` when there is none or it is a base.
+
+### Checking a version before it is published
+
+```ts
+await service.activate('welcome', 3, 'ana', { checkRender: { context: sampleContext } });
+```
+
+renders version 3 as a send would before writing anything. If it does not render,
+`ManagedTemplateRenderCheckError` is thrown and the store is untouched: the `MessageDefinition`
+keeps its status and no `Provenance` is created, so the audit trail never records a publication that
+did not happen.
+
 ### Deleting a version
 
 `deleteTemplate` deletes only a version that was never published: still `draft`, with no

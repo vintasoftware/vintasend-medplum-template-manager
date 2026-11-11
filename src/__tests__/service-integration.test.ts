@@ -18,9 +18,10 @@ import {
   type ManagedEmailTemplateContent,
   type ManagedTemplateCreateInput,
   ManagedTemplateEmailRenderer,
+  ManagedTemplateRenderCheckError,
   ManagedTemplateService,
 } from 'vintasend-managed-templates';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { MedplumTemplateManagerBackend } from '../medplum-template-manager-backend.js';
 
@@ -122,6 +123,9 @@ describe('the whole stack over Medplum', () => {
         subjectTemplate: '{% managed_extends "base-email" %}Welcome aboard',
       }),
     );
+    // A send composes parts at their newest published version, so the parts are published too.
+    await service.activate('base-email');
+    await service.activate('footer');
     await service.activate('welcome');
 
     const result = await service.render(notification('welcome'), { name: 'Ana' });
@@ -223,6 +227,81 @@ describe('the whole stack over Medplum', () => {
     await expect(
       service.getPaginatedTemplates(1, 10, true, { field: 'status', direction: 'asc' }),
     ).rejects.toThrow(/orderBy\.status/);
+  });
+
+  it('previews draft parts and sends published ones, with no composer configured', async () => {
+    await service.createTemplate(
+      createInput('base', { bodyTemplate: 'v1[{% managed_children %}]' }),
+    );
+    await service.activate('base');
+    await service.updateTemplate('base', { bodyTemplate: 'v2[{% managed_children %}]' });
+    await service.createTemplate(
+      createInput('welcome', { bodyTemplate: '{% managed_extends "base" %}Hi {name}' }),
+    );
+    await service.activate('welcome');
+    const welcome = await service.getTemplate('welcome');
+
+    const preview = await service.renderStandalone(welcome, { name: 'Ana' }, { parts: 'latest' });
+    const sent = await service.render(notification('welcome'), { name: 'Ana' });
+
+    expect(preview.rendered.body).toBe('v2[Hi Ana]');
+    expect(sent.rendered.body).toBe('v1[Hi Ana]');
+  });
+
+  it('activates after a passing render check, with its Provenance', async () => {
+    const medplum = new MockClient();
+    const store = new MedplumTemplateManagerBackend(medplum);
+    const checked = new ManagedTemplateService(
+      store,
+      new ManagedTemplateEmailRenderer<TestConfig>(store, new EchoEmailRenderer()),
+    );
+    await checked.createTemplate(createInput('welcome'));
+
+    const activated = await checked.activate('welcome', 1, 'ana', {
+      checkRender: { context: { name: 'Ana' } },
+    });
+
+    expect(activated.status).toBe('active');
+    expect(await medplum.searchResources('Provenance', {})).toHaveLength(1);
+  });
+
+  it('writes no Provenance and no status when the render check fails', async () => {
+    const medplum = new MockClient();
+    const store = new MedplumTemplateManagerBackend(medplum);
+    const checked = new ManagedTemplateService(
+      store,
+      new ManagedTemplateEmailRenderer<TestConfig>(store, new EchoEmailRenderer()),
+    );
+    // The base is a draft, so a send could not compose it.
+    await checked.createTemplate(createInput('base', { bodyTemplate: '[{% managed_children %}]' }));
+    await checked.createTemplate(
+      createInput('welcome', { bodyTemplate: '{% managed_extends "base" %}Hi' }),
+    );
+    const before = [...(await medplum.searchResources('MessageDefinition', {}))];
+    const update = vi.spyOn(medplum, 'updateResource');
+    const create = vi.spyOn(medplum, 'createResource');
+
+    await expect(
+      checked.activate('welcome', 1, 'ana', { checkRender: { context: {} } }),
+    ).rejects.toThrow(ManagedTemplateRenderCheckError);
+
+    expect(update).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    expect(await medplum.searchResources('Provenance', {})).toHaveLength(0);
+    expect((await checked.getTemplate('welcome', 1)).status).toBe('draft');
+    expect([...(await medplum.searchResources('MessageDefinition', {}))]).toEqual(before);
+  });
+
+  it('reports the version new emails get, skipping drafts and bases', async () => {
+    await service.createTemplate(createInput('base', { bodyTemplate: '[{% managed_children %}]' }));
+    await service.activate('base');
+    await service.createTemplate(createInput('welcome'));
+    await service.activate('welcome');
+    await service.updateTemplate('welcome', {});
+
+    expect(await service.getCurrentTemplateVersion('welcome')).toBe(1);
+    expect(await service.getCurrentTemplateVersion('base')).toBeNull();
+    expect(await service.getCurrentTemplateVersion('missing')).toBeNull();
   });
 
   it('pages without repeating or dropping a row', async () => {
